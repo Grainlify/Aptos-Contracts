@@ -8,10 +8,10 @@ Grainlify on any chain.
 ## What this is
 
 A port of the Soroban `GrainhackEscrow` (see the `Stellar-Contracts` repository),
-not a fresh design. The arguments about
-domain separation, write-once roots, mark-before-transfer and pull-only claims
-were had once already and are recorded in that contract's source; this module
-follows them so the two chains cannot disagree about what a leaf means.
+not a fresh design. The arguments about domain separation, write-once roots,
+mark-before-transfer and pull-only claims were had once already and are recorded
+in that contract's source; this module follows them so the two chains cannot
+disagree about what a leaf means.
 
 Two rules govern every decision in `sources/escrow.move`:
 
@@ -119,22 +119,22 @@ authoritative artefact.
 
 **The authoritative artefact is `internal/chain/testdata/leaf_vector.json` in the
 Grainlify backend.** Move cannot read a file at runtime, so the values have to be
-literals somewhere, and reaching across a repository boundary to fetch them would
-break this package's ability to be extracted with no edits — a harder requirement
-than avoiding a copy.
+literals somewhere, and reaching into another repository to fetch them is exactly
+what this one must not do.
 
 What holds the copy in place:
 
 1. The values are **frozen**. They pin a construction a published root depends
    on, so changing one is not a refactor, it is invalidating every proof already
    served.
-2. The backend has two tests — `TestAptosFixture_IsAByteForByteCopy` and
-   `TestAptosMoveLiterals_MatchTheVector` — which read the JSON copy *and* parse
-   the hex literals out of `tests/tree_vectors.move`, failing if either
-   disagrees. They skip cleanly once this package is extracted and the paths stop
-   resolving.
-3. The JSON copy is byte-identical, so the two repositories can be diffed without
+2. **Each implementation asserts the digests independently.** This is the real
+   guard, and it works wherever the suites run: Go, Rust and Move each compute
+   the same roots from the same rule, so a divergence turns one of the three red.
+3. The JSON copy is byte-identical, so the repositories can be diffed without
    reading Move.
+
+The backend's two drift tests are a fourth, weaker layer — see *Related
+repositories* below for why they are a convenience rather than a gate.
 
 ### What the vectors pin
 

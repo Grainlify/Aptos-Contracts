@@ -1,0 +1,4 @@
+# Compiler output and fetched git dependencies. Both are reproducible from
+# Move.toml, and the fetched aptos-framework is large.
+build/
+.aptos/

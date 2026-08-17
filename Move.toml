@@ -1,0 +1,23 @@
+[package]
+name = "GrainlifyPayout"
+version = "0.1.0"
+license = "MIT"
+
+# This package is self-contained on purpose. It is intended to be lifted into
+# its own repository with no edits: nothing here refers to a path outside this
+# directory, and the cross-implementation Merkle vectors it verifies against are
+# copied in as test fixtures rather than read across a repository boundary.
+#
+# If a change would require editing a path to extract this package, that change
+# is wrong.
+
+[addresses]
+grainlify_payout = "_"
+
+[dev-addresses]
+grainlify_payout = "0xCAFE"
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-core.git"
+subdir = "aptos-move/framework/aptos-framework"
+rev = "mainnet"

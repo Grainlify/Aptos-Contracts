@@ -7,12 +7,19 @@ module grainlify_payout::escrow_tests {
     use aptos_framework::account;
     use aptos_framework::fungible_asset::Metadata;
     use aptos_framework::object::Object;
+    use aptos_framework::timestamp;
 
     use grainlify_payout::escrow;
     use grainlify_payout::test_asset;
     use grainlify_payout::tree_vectors;
 
     const EVENT_ID: vector<u8> = b"founding-pool-2026";
+    const SWEEP_DEST: address = @0x5EED;
+    // A short window keeps the tests readable. Real events use
+    // escrow::recommended_claim_window() (24 months) or longer.
+    const WINDOW: u64 = 1000;
+    // Genesis-ish start so deadline arithmetic is not near zero.
+    const T0: u64 = 1_000_000;
 
     struct Fixture has drop {
         admin_addr: address,
@@ -20,11 +27,14 @@ module grainlify_payout::escrow_tests {
         metadata: Object<Metadata>,
     }
 
-    fun setup(admin: &signer, funding: u64): Fixture {
+    fun setup(aptos_framework: &signer, admin: &signer, funding: u64): Fixture {
+        timestamp::set_time_has_started_for_testing(aptos_framework);
+        timestamp::update_global_time_for_test_secs(T0);
+
         let admin_addr = signer::address_of(admin);
         let metadata = test_asset::create(admin);
 
-        escrow::initialise(admin, EVENT_ID, metadata);
+        escrow::initialise(admin, EVENT_ID, metadata, SWEEP_DEST, WINDOW);
         let escrow_addr = escrow::escrow_address(admin_addr, EVENT_ID);
 
         if (funding > 0) {
@@ -106,17 +116,17 @@ module grainlify_payout::escrow_tests {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    #[test(admin = @0xA11CE)]
-    fun funding_credits_the_escrow(admin: &signer) {
-        let f = setup(admin, 1_000_000);
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun funding_credits_the_escrow(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 1_000_000);
         assert!(escrow::balance(f.escrow_addr) == 1_000_000, 0);
         assert!(option::is_none(&escrow::root(f.escrow_addr)), 1);
         assert!(escrow::event_id(f.escrow_addr) == EVENT_ID, 2);
     }
 
-    #[test(admin = @0xA11CE)]
-    fun publish_root_records_the_root_and_total(admin: &signer) {
-        let f = setup(admin, 1_000_000);
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun publish_root_records_the_root_and_total(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 1_000_000);
         let root = tree_vectors::root_3();
         escrow::publish_root(admin, f.escrow_addr, root, 600_000);
 
@@ -126,36 +136,36 @@ module grainlify_payout::escrow_tests {
 
     // Write-once, and permanently. A second root would either invalidate proofs
     // already served or silently change what somebody is owed.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 6, location = grainlify_payout::escrow)]
-    fun a_root_cannot_be_republished(admin: &signer) {
-        let f = setup(admin, 1_000_000);
+    fun a_root_cannot_be_republished(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 1_000_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 600_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_5(), 100_000);
     }
 
     // Refused rather than accepted-and-stranded: the last claimants would find
     // nothing left, having been told on-chain they were owed it.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 4, location = grainlify_payout::escrow)]
-    fun a_root_larger_than_the_escrow_is_refused(admin: &signer) {
-        let f = setup(admin, 500_000);
+    fun a_root_larger_than_the_escrow_is_refused(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 500_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 500_001);
     }
 
-    #[test(admin = @0xA11CE, stranger = @0xBEEF)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE, stranger = @0xBEEF)]
     #[expected_failure(abort_code = 3, location = grainlify_payout::escrow)]
-    fun only_the_admin_may_publish(admin: &signer, stranger: &signer) {
-        let f = setup(admin, 1_000_000);
+    fun only_the_admin_may_publish(aptos_framework: &signer, admin: &signer, stranger: &signer) {
+        let f = setup(aptos_framework, admin, 1_000_000);
         escrow::publish_root(stranger, f.escrow_addr, tree_vectors::root_3(), 600_000);
     }
 
     // Funding after publication could only create a surplus no leaf accounts
     // for, and this version has no sweep to retrieve it.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 11, location = grainlify_payout::escrow)]
-    fun funding_after_publication_is_refused(admin: &signer) {
-        let f = setup(admin, 1_000_000);
+    fun funding_after_publication_is_refused(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 1_000_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 600_000);
         test_asset::mint(admin, f.admin_addr, 1);
         escrow::fund(admin, f.escrow_addr, 1);
@@ -171,9 +181,9 @@ module grainlify_payout::escrow_tests {
     // Three leaves specifically. A two-leaf tree has a single level and its
     // proof never touches promotion, so a verifier that duplicated the odd node
     // instead of promoting it would pass a two-leaf suite completely.
-    #[test(admin = @0xA11CE)]
-    fun a_claim_pays_through_a_promoted_node_in_an_odd_tree(admin: &signer) {
-        let f = setup(admin, 600_000);
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun a_claim_pays_through_a_promoted_node_in_an_odd_tree(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 600_000);
 
         let a = account_at(@0xAAA1);
         let b = account_at(@0xBBB2);
@@ -224,10 +234,10 @@ module grainlify_payout::escrow_tests {
     }
 
     // Claiming twice is refused rather than paying twice.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 8, location = grainlify_payout::escrow)]
-    fun a_leaf_cannot_be_claimed_twice(admin: &signer) {
-        let f = setup(admin, 300_000);
+    fun a_leaf_cannot_be_claimed_twice(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
         let a = account_at(@0xAAA1);
         let b = account_at(@0xBBB2);
         let id_a = id(0x0A);
@@ -250,10 +260,10 @@ module grainlify_payout::escrow_tests {
 
     // A valid proof presented by a different address must not verify. The
     // claiming address is inside the leaf, so the proof only fits its owner.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 7, location = grainlify_payout::escrow)]
-    fun a_proof_cannot_be_replayed_by_another_address(admin: &signer) {
-        let f = setup(admin, 300_000);
+    fun a_proof_cannot_be_replayed_by_another_address(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
         let a = account_at(@0xAAA1);
         let b = account_at(@0xBBB2);
         let thief = account_at(@0xDEAD);
@@ -272,10 +282,10 @@ module grainlify_payout::escrow_tests {
 
     // Changing the amount changes the leaf, so a proof cannot be reused to
     // claim more than it was built for.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 7, location = grainlify_payout::escrow)]
-    fun the_amount_is_bound_into_the_leaf(admin: &signer) {
-        let f = setup(admin, 300_000);
+    fun the_amount_is_bound_into_the_leaf(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
         let a = account_at(@0xAAA1);
         let b = account_at(@0xBBB2);
         let id_a = id(0x0A);
@@ -294,10 +304,10 @@ module grainlify_payout::escrow_tests {
     // An internal node offered as a leaf, with a proof one level short. The
     // node prefix is what makes the two hash domains disjoint and this
     // impossible.
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 7, location = grainlify_payout::escrow)]
-    fun an_internal_node_cannot_be_claimed_as_a_leaf(admin: &signer) {
-        let f = setup(admin, 600_000);
+    fun an_internal_node_cannot_be_claimed_as_a_leaf(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 600_000);
         let a = account_at(@0xAAA1);
         let b = account_at(@0xBBB2);
         let attacker = account_at(@0xDEAD);
@@ -317,18 +327,18 @@ module grainlify_payout::escrow_tests {
         escrow::claim(&attacker, f.escrow_addr, id(0x0F), 300_000, proof);
     }
 
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 5, location = grainlify_payout::escrow)]
-    fun claiming_before_a_root_is_published_fails(admin: &signer) {
-        let f = setup(admin, 300_000);
+    fun claiming_before_a_root_is_published_fails(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
         let a = account_at(@0xAAA1);
         escrow::claim(&a, f.escrow_addr, id(0x0A), 100_000, vector::empty<vector<u8>>());
     }
 
-    #[test(admin = @0xA11CE)]
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 9, location = grainlify_payout::escrow)]
-    fun a_zero_amount_claim_is_refused(admin: &signer) {
-        let f = setup(admin, 300_000);
+    fun a_zero_amount_claim_is_refused(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
         let a = account_at(@0xAAA1);
         escrow::claim(&a, f.escrow_addr, id(0x0A), 0, vector::empty<vector<u8>>());
@@ -356,6 +366,241 @@ module grainlify_payout::escrow_tests {
             tree_vectors::aptos_leaf_amount(),
         );
         assert!(got == tree_vectors::aptos_leaf(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sweeps
+    // -----------------------------------------------------------------------
+
+    // Residue is sweepable immediately, and cannot touch what the root promised.
+    //
+    // The strong form of the assertion: fund ABOVE the root, sweep the residue,
+    // then claim every leaf successfully. If sweep_residue ever reached into
+    // root_total, the last claim would fail for want of balance.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun sweep_residue_cannot_touch_what_the_root_promised(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 350_000);
+        let a = account_at(@0xAAA1);
+        let b = account_at(@0xBBB2);
+        let id_a = id(0x0A);
+        let id_b = id(0x0B);
+
+        let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
+        let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
+        let root = escrow::hash_node_for_test(leaf_a, leaf_b);
+        // Funded 350_000 against a root of 300_000: 50_000 is residue.
+        escrow::publish_root(admin, f.escrow_addr, root, 300_000);
+
+        escrow::sweep_residue(admin, f.escrow_addr);
+        assert!(test_asset::balance_of(SWEEP_DEST, f.metadata) == 50_000, 0);
+        assert!(escrow::balance(f.escrow_addr) == 300_000, 1);
+
+        // Both claims still succeed in full.
+        let pa = vector::empty<vector<u8>>();
+        vector::push_back(&mut pa, leaf_b);
+        escrow::claim(&a, f.escrow_addr, id_a, 100_000, pa);
+
+        let pb = vector::empty<vector<u8>>();
+        vector::push_back(&mut pb, leaf_a);
+        escrow::claim(&b, f.escrow_addr, id_b, 200_000, pb);
+
+        assert!(test_asset::balance_of(signer::address_of(&a), f.metadata) == 100_000, 2);
+        assert!(test_asset::balance_of(signer::address_of(&b), f.metadata) == 200_000, 3);
+        assert!(escrow::balance(f.escrow_addr) == 0, 4);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 15, location = grainlify_payout::escrow)]
+    fun sweep_residue_with_nothing_spare_is_refused(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        escrow::sweep_residue(admin, f.escrow_addr);
+    }
+
+    // The timelock: one second before the deadline it is refused, at the deadline
+    // it succeeds.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 14, location = grainlify_payout::escrow)]
+    fun sweeping_unclaimed_before_the_deadline_is_refused(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        timestamp::update_global_time_for_test_secs(T0 + WINDOW - 1);
+        escrow::sweep_unclaimed(admin, f.escrow_addr);
+    }
+
+    // And the whole point of the design: the sweep leaves the root and the
+    // claimed markers intact, so a late claimant can still prove what they were
+    // owed from chain state alone.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun sweeping_unclaimed_leaves_the_evidence_intact(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        let a = account_at(@0xAAA1);
+        let b = account_at(@0xBBB2);
+        let id_a = id(0x0A);
+        let id_b = id(0x0B);
+
+        let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
+        let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
+        let root = escrow::hash_node_for_test(leaf_a, leaf_b);
+        escrow::publish_root(admin, f.escrow_addr, root, 300_000);
+
+        // One of the two claims; the other never turns up.
+        let pa = vector::empty<vector<u8>>();
+        vector::push_back(&mut pa, leaf_b);
+        escrow::claim(&a, f.escrow_addr, id_a, 100_000, pa);
+        assert!(escrow::claimed_total(f.escrow_addr) == 100_000, 0);
+
+        timestamp::update_global_time_for_test_secs(T0 + WINDOW);
+        escrow::sweep_unclaimed(admin, f.escrow_addr);
+
+        assert!(test_asset::balance_of(SWEEP_DEST, f.metadata) == 200_000, 1);
+        assert!(escrow::balance(f.escrow_addr) == 0, 2);
+
+        // The evidence a late claimant needs is all still readable.
+        assert!(option::borrow(&escrow::root(f.escrow_addr)) == &root, 3);
+        assert!(escrow::root_total(f.escrow_addr) == 300_000, 4);
+        assert!(escrow::claimed_total(f.escrow_addr) == 100_000, 5);
+        assert!(escrow::is_claimed(f.escrow_addr, leaf_a), 6);
+        assert!(!escrow::is_claimed(f.escrow_addr, leaf_b), 7);
+    }
+
+    // A claimant arriving AFTER the deadline is still paid, so long as nobody has
+    // swept. The deadline opens the sweep; it does not close claims.
+    //
+    // This is the largest mitigation for the late-claimant case, and it is a
+    // property of an assertion that is deliberately absent from claim().
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun a_claim_after_the_deadline_still_pays_until_the_sweep(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        let a = account_at(@0xAAA1);
+        let b = account_at(@0xBBB2);
+        let id_a = id(0x0A);
+        let id_b = id(0x0B);
+
+        let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
+        let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
+        let root = escrow::hash_node_for_test(leaf_a, leaf_b);
+        escrow::publish_root(admin, f.escrow_addr, root, 300_000);
+
+        // Well past the deadline, and no sweep has happened.
+        timestamp::update_global_time_for_test_secs(T0 + WINDOW + 10_000);
+
+        let pa = vector::empty<vector<u8>>();
+        vector::push_back(&mut pa, leaf_b);
+        escrow::claim(&a, f.escrow_addr, id_a, 100_000, pa);
+        assert!(test_asset::balance_of(signer::address_of(&a), f.metadata) == 100_000, 0);
+    }
+
+    // Extend-only, from both sides.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun extending_the_deadline_reopens_a_sweep_that_was_legal(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        assert!(escrow::claim_deadline(f.escrow_addr) == T0 + WINDOW, 0);
+
+        timestamp::update_global_time_for_test_secs(T0 + WINDOW);
+        // Sweepable right now. Extending must make it not so.
+        escrow::extend_deadline(admin, f.escrow_addr, T0 + WINDOW + 500);
+        assert!(escrow::claim_deadline(f.escrow_addr) == T0 + WINDOW + 500, 1);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 14, location = grainlify_payout::escrow)]
+    fun a_sweep_that_was_legal_becomes_illegal_after_an_extension(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        timestamp::update_global_time_for_test_secs(T0 + WINDOW);
+        escrow::extend_deadline(admin, f.escrow_addr, T0 + WINDOW + 500);
+        escrow::sweep_unclaimed(admin, f.escrow_addr);
+    }
+
+    // The safety property. An earlier deadline is refused, so the admin can never
+    // bring a cutoff forward.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 13, location = grainlify_payout::escrow)]
+    fun the_deadline_cannot_be_shortened(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        escrow::extend_deadline(admin, f.escrow_addr, T0 + WINDOW - 1);
+    }
+
+    // Equal is not later. Guards the boundary of the comparison.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 13, location = grainlify_payout::escrow)]
+    fun the_deadline_cannot_be_set_to_itself(aptos_framework: &signer, admin: &signer) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        escrow::extend_deadline(admin, f.escrow_addr, T0 + WINDOW);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE, stranger = @0xBEEF)]
+    #[expected_failure(abort_code = 3, location = grainlify_payout::escrow)]
+    fun only_the_admin_may_extend(
+        aptos_framework: &signer, admin: &signer, stranger: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        escrow::extend_deadline(stranger, f.escrow_addr, T0 + WINDOW + 500);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE, stranger = @0xBEEF)]
+    #[expected_failure(abort_code = 3, location = grainlify_payout::escrow)]
+    fun only_the_admin_may_sweep_unclaimed(
+        aptos_framework: &signer, admin: &signer, stranger: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        timestamp::update_global_time_for_test_secs(T0 + WINDOW);
+        escrow::sweep_unclaimed(stranger, f.escrow_addr);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 5, location = grainlify_payout::escrow)]
+    fun residue_cannot_be_swept_before_a_root_exists(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        // No root, so every token is potentially claimable and none is residue.
+        escrow::sweep_residue(admin, f.escrow_addr);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun the_sweep_destination_and_window_are_readable_from_creation(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 0);
+        assert!(escrow::sweep_dest(f.escrow_addr) == SWEEP_DEST, 0);
+        assert!(escrow::claim_window(f.escrow_addr) == WINDOW, 1);
+        // Zero until a root exists: the clock starts at publication.
+        assert!(escrow::claim_deadline(f.escrow_addr) == 0, 2);
+    }
+
+    // 24 months, the agreed default.
+    #[test]
+    fun the_recommended_window_is_twenty_four_months() {
+        assert!(escrow::recommended_claim_window() == 730 * 24 * 60 * 60, 0);
+    }
+
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 12, location = grainlify_payout::escrow)]
+    fun a_zero_claim_window_is_refused(aptos_framework: &signer, admin: &signer) {
+        timestamp::set_time_has_started_for_testing(aptos_framework);
+        let metadata = test_asset::create(admin);
+        escrow::initialise(admin, EVENT_ID, metadata, SWEEP_DEST, 0);
     }
 
     // The leaf must be deterministic across runs and machines, or a root built

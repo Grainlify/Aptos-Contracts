@@ -30,21 +30,92 @@ and pushing requires holding everyone's address at once.
 
 | Function | Caller | Notes |
 | --- | --- | --- |
-| `initialise` | admin | One escrow per `(admin, event_id)`, at a deterministic address |
+| `initialise` | admin | One escrow per `(admin, event_id)`. Fixes the sweep destination and claim window |
 | `fund` | anyone | Refused once a root is published |
-| `publish_root` | admin | Once per event, permanently. Refuses `total > balance` |
-| `claim` | the claimant | Verifies a proof, marks claimed, then transfers |
-| `is_claimed` | anyone | View, for the reconciler |
+| `publish_root` | admin | Once per event, permanently. Refuses `total > balance`. Starts the claim clock |
+| `claim` | the claimant | Verifies a proof, marks claimed, then transfers. **No deadline check** |
+| `extend_deadline` | admin | Can only move the deadline **later** |
+| `sweep_residue` | admin | Returns `balance − root_total` only. No timelock |
+| `sweep_unclaimed` | admin | Returns the remainder, after the deadline |
+| `is_claimed`, `claim_deadline`, `claimed_total`, `sweep_dest`, `claim_window` | anyone | Views |
 | `balance`, `root`, `root_total`, `event_id`, `leaf_for`, `escrow_address` | anyone | Views |
 
-Deliberately **not** in this version: a maintainer pool, a timelocked sweep,
-commit–reveal for draw seeds, and any form of cancellation. The first three exist
-in the Soroban contract and are the obvious next additions; the fourth is a
-design question, not an omission.
+Deliberately **not** in this version: a maintainer pool, commit–reveal for draw
+seeds, and any form of cancellation. The first two exist in the Soroban contract
+and are the obvious next additions; the third is a design question, not an
+omission.
 
-Because there is no sweep, **funds committed to a root that nobody claims are
-currently unrecoverable.** That is acceptable for a testnet rehearsal and is a
-blocker for anything else.
+## The sweep
+
+A sweep is an admin moving somebody else's money, which is the thing this
+contract otherwise makes impossible. Everything below exists to constrain that.
+
+### Two functions, because there are two pots
+
+A settled escrow holds two amounts with opposite risk profiles, and the Soroban
+contract's single `sweep` conflates them. That is the one thing here that is not a
+port.
+
+| Pot | Amount | Belongs to | Risk of moving it |
+| --- | --- | --- | --- |
+| Residue | `balance − root_total` | Nobody — no leaf can claim it | None whatsoever |
+| Unclaimed | `root_total − claimed_total` | Named individuals who have not turned up | Taking money from a person |
+
+Conflating them makes the safe operation inherit the dangerous one's timelock,
+and — worse — normalises the dangerous one by association. “We sweep the escrow
+after settlement” sounds routine; “we take unclaimed payouts from 38 named
+people” is the same sentence.
+
+So `sweep_residue` has no timelock, because there is no argument for one. Only
+`sweep_unclaimed` is constrained.
+
+### What the admin cannot do
+
+| Dimension | Discretion | Constrained by |
+| --- | --- | --- |
+| Destination | **None** | Fixed at `initialise`, before funding. No parameter exists anywhere |
+| Amount | **None** | Residue is arithmetic; unclaimed is whatever nobody took |
+| Timing | **One-directional** | `extend_deadline` can only increase the deadline |
+| Who is affected | **None** | No per-leaf sweep. All remaining unclaimed, or nothing |
+
+The extend-only rule is the entire safety property. It turns “the admin can cut
+people off” into “the admin can only give more time”, so the worst use of it is
+delaying their own sweep. **Do not relax it** — it is the kind of constraint
+someone removes later for convenience, because the failing call looks like an
+obstacle rather than the guarantee.
+
+### The claimant who arrives late
+
+Not solved, and not presented as solved. A deadline that can be enforced is a
+deadline somebody can miss. Four things reduce the harm:
+
+1. **The deadline gates the sweep, not the claim.** There is deliberately no
+   deadline assertion in `claim`, so a late claimant is paid in full for as long
+   as nobody has swept. They are only cut off by a deliberate admin act, not by a
+   clock ticking over. This is the largest mitigation and it is a property of what
+   is *absent* from `claim` — easy to destroy by adding one plausible assertion.
+2. **A long window.** 24 months is the agreed default
+   (`recommended_claim_window()`). Idle funds cost the treasury inconvenience; a
+   missed claim costs a person their payout. Those are not comparable, so the
+   window wants to be the longest anyone will tolerate.
+3. **Extension is the documented remedy**, not an exception. The money is still in
+   escrow, so extending is a real fix, and it is a public on-chain act.
+4. **The sweep leaves the evidence intact.** The root, `root_total`,
+   `claimed_total` and every claimed marker survive it, so a late claimant holding
+   their proof can demonstrate from chain state alone exactly what they were owed —
+   without needing to be believed and without trusting our database.
+
+`SweptUnclaimed` carries the full shortfall (`root_total`, `claimed_total`, amount
+taken), so what was removed from people is public record rather than an internal
+number.
+
+### No claim-rate floor
+
+A rule refusing to sweep below some claimed fraction was considered and rejected.
+It can permanently trap funds in a way nobody can undo, and it hard-codes a
+judgement a person looking at a bad claim rate makes better. The remedy for a low
+claim rate is to extend and chase people; the emitted shortfall is what makes that
+visible enough to act on.
 
 ## Two things a reader should know before changing anything
 

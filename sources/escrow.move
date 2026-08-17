@@ -29,6 +29,7 @@ module grainlify_payout::escrow {
     use aptos_framework::fungible_asset::{Self, FungibleStore, Metadata};
     use aptos_framework::object::{Self, ExtendRef, Object};
     use aptos_framework::primary_fungible_store;
+    use aptos_framework::timestamp;
 
     // -----------------------------------------------------------------------
     // Domain separation
@@ -65,6 +66,19 @@ module grainlify_payout::escrow {
     /// Aptos address width.
     const DIGEST_LEN: u64 = 32;
 
+    /// The agreed default claim window: 24 months in seconds.
+    ///
+    /// Not enforced - `initialise` takes the window as an argument, because an
+    /// event whose contributors are individually known and can be chased should
+    /// use a far longer one. This is the figure to reach for absent a reason.
+    ///
+    /// The asymmetry behind it is not close. Funds sitting unswept cost the
+    /// treasury some inconvenience; a claim missed to a deadline costs a person
+    /// their payout. Those are not comparable magnitudes, so the window wants to
+    /// be the longest anybody will tolerate rather than the shortest that looks
+    /// tidy.
+    const RECOMMENDED_CLAIM_WINDOW: u64 = 63072000;
+
     // -----------------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------------
@@ -82,6 +96,15 @@ module grainlify_payout::escrow {
     /// Funding after publication could only create a surplus the published root
     /// does not account for, so it is refused rather than silently accepted.
     const E_ALREADY_SETTLED: u64 = 11;
+    /// A zero claim window would make every claim late the instant a root is
+    /// published.
+    const E_INVALID_WINDOW: u64 = 12;
+    /// The deadline may only ever move later. See `extend_deadline`.
+    const E_DEADLINE_NOT_LATER: u64 = 13;
+    /// Claims are still open, so unclaimed funds are not sweepable yet.
+    const E_CLAIM_WINDOW_OPEN: u64 = 14;
+    /// Nothing to sweep.
+    const E_NO_RESIDUE: u64 = 15;
 
     // -----------------------------------------------------------------------
     // State
@@ -119,6 +142,36 @@ module grainlify_payout::escrow {
         /// Claimed markers keyed by leaf digest. A table rather than a vector
         /// so claim cost does not grow with the number of claimants.
         claimed: Table<vector<u8>, bool>,
+        /// Running sum of everything claimed.
+        ///
+        /// Maintained rather than derived, because a table's values cannot be
+        /// totalled on-chain. It is what makes the shortfall at sweep time a
+        /// published number instead of something reconstructed afterwards from
+        /// events.
+        claimed_total: u64,
+        /// Where a sweep sends funds. **Fixed here at creation and never
+        /// changeable.**
+        ///
+        /// Fixed at initialisation rather than at publication, which is earlier
+        /// than it strictly needs to be and deliberately so: the guarantee worth
+        /// having is that a contributor can see where unclaimed money goes
+        /// before they have any reason to care. Initialisation precedes funding,
+        /// which precedes publication, so this is public before a single token
+        /// enters the contract.
+        ///
+        /// If this address is ever lost, the sweep becomes permanently unusable
+        /// and the funds stay in escrow. That is the correct direction to fail,
+        /// and is why there is no path to change it.
+        sweep_dest: address,
+        /// How long after publication claims remain open, in seconds. Set here
+        /// so it is knowable before anybody commits work.
+        claim_window: u64,
+        /// The absolute deadline, computed at publication.
+        ///
+        /// Zero until a root is published. The clock starts when claims become
+        /// *possible*, not when the escrow was created - an escrow can sit
+        /// unfunded for months and that must not eat into anyone's window.
+        claim_deadline: u64,
     }
 
     #[event]
@@ -126,6 +179,10 @@ module grainlify_payout::escrow {
         escrow: address,
         event_id: vector<u8>,
         admin: address,
+        /// Emitted so the destination is on the record from creation, not first
+        /// visible when somebody sweeps.
+        sweep_dest: address,
+        claim_window: u64,
     }
 
     #[event]
@@ -141,6 +198,40 @@ module grainlify_payout::escrow {
         escrow: address,
         root: vector<u8>,
         total: u64,
+        /// The deadline and destination are echoed here because publication is
+        /// the moment claims become real, and both are things a claimant needs
+        /// to be able to read without trusting anything we say off-chain.
+        claim_deadline: u64,
+        sweep_dest: address,
+    }
+
+    #[event]
+    struct DeadlineExtended has drop, store {
+        escrow: address,
+        old_deadline: u64,
+        new_deadline: u64,
+    }
+
+    #[event]
+    struct SweptResidue has drop, store {
+        escrow: address,
+        amount: u64,
+        dest: address,
+    }
+
+    #[event]
+    /// Emitted when unclaimed entitlements are swept.
+    ///
+    /// Carries the shortfall in full - what the root promised, what was actually
+    /// claimed, and what was taken - so the size of what was removed from named
+    /// people is a matter of public record rather than an internal number. A
+    /// successor escrow for late claimants is computable from this alone.
+    struct SweptUnclaimed has drop, store {
+        escrow: address,
+        amount: u64,
+        root_total: u64,
+        claimed_total: u64,
+        dest: address,
     }
 
     #[event]
@@ -179,16 +270,34 @@ module grainlify_payout::escrow {
     }
 
     /// Create an event's escrow. One per (admin, event_id).
+    ///
+    /// `sweep_dest` and `claim_window` are both fixed here, before funding and
+    /// before publication, so that everything about what happens to unclaimed
+    /// money is public before there is any money to be unclaimed.
+    ///
+    /// On the window: 24 months is the agreed default (`RECOMMENDED_CLAIM_WINDOW`).
+    /// The asymmetry driving that is not close - idle funds cost the treasury
+    /// some inconvenience, while a missed claim costs a person their payout - so
+    /// the window should be the longest anyone will tolerate rather than the
+    /// shortest that seems tidy. For an event whose contributors are individually
+    /// known and can simply be chased, a window of years is the right answer, and
+    /// means the sweep exists and is tested without ever being reached.
     public entry fun initialise(
         admin: &signer,
         event_id: vector<u8>,
         metadata: Object<Metadata>,
+        sweep_dest: address,
+        claim_window: u64,
     ) {
         let admin_addr = signer::address_of(admin);
         assert!(
             !exists<Escrow>(escrow_address(admin_addr, event_id)),
             E_ALREADY_INITIALISED,
         );
+        // A zero window would make every claim late the instant a root is
+        // published, which is the one configuration that turns this contract
+        // into a way of not paying people.
+        assert!(claim_window > 0, E_INVALID_WINDOW);
 
         let ctor = object::create_named_object(admin, event_seed(event_id));
         let obj_signer = object::generate_signer(&ctor);
@@ -204,20 +313,29 @@ module grainlify_payout::escrow {
             root: option::none<vector<u8>>(),
             root_total: 0,
             claimed: table::new<vector<u8>, bool>(),
+            claimed_total: 0,
+            sweep_dest,
+            claim_window,
+            claim_deadline: 0,
         });
 
         event::emit(EscrowCreated {
             escrow: signer::address_of(&obj_signer),
             event_id,
             admin: admin_addr,
+            sweep_dest,
+            claim_window,
         });
     }
 
     /// Move budget into escrow. Anyone may fund; only a claim takes money out.
     ///
     /// Refused once a root is published: the root asserts `total <= balance` at
-    /// publication, so a later top-up can only create a surplus that no leaf
-    /// accounts for and that this version has no sweep to retrieve.
+    /// publication, so a later top-up could only create a surplus that no leaf
+    /// accounts for. `sweep_residue` exists to retrieve exactly that surplus,
+    /// but a top-up after publication is still refused - it is far more likely to
+    /// be a mistake than an intention, and there is no reason to accept money
+    /// that provably cannot be claimed.
     public entry fun fund(
         sponsor: &signer,
         escrow_addr: address,
@@ -279,7 +397,61 @@ module grainlify_payout::escrow {
         escrow.root = option::some(root);
         escrow.root_total = total;
 
-        event::emit(RootPublished { escrow: escrow_addr, root, total });
+        // The clock starts here, not at initialisation. An escrow can sit
+        // unfunded for months and none of that time should count against a
+        // contributor's window to claim.
+        escrow.claim_deadline = timestamp::now_seconds() + escrow.claim_window;
+
+        event::emit(RootPublished {
+            escrow: escrow_addr,
+            root,
+            total,
+            claim_deadline: escrow.claim_deadline,
+            sweep_dest: escrow.sweep_dest,
+        });
+    }
+
+    /// Push the claim deadline further out. **It can only ever move later.**
+    ///
+    /// THIS ONE-DIRECTIONALITY IS THE ENTIRE SAFETY PROPERTY OF THE SWEEP. DO NOT
+    /// RELAX IT.
+    ///
+    /// A sweep is an admin moving somebody else's money, which is the thing this
+    /// contract otherwise makes impossible. What makes it tolerable is that every
+    /// power the admin holds over the deadline points in the claimant's favour:
+    /// they may grant more time, and they may never take time away. So the worst
+    /// an admin can do with this function is delay their own sweep.
+    ///
+    /// Allowing a decrease - even "only before anyone has claimed", even "only for
+    /// operational reasons" - converts this from "the admin can give people more
+    /// time" into "the admin can cut people off", and those are different
+    /// contracts. It is exactly the kind of constraint somebody removes later for
+    /// convenience, because the failing call looks like an obstacle rather than
+    /// the guarantee.
+    ///
+    /// This is also the documented remedy for a late claimant: their money is
+    /// still in escrow, so extending is a real fix rather than a gesture, and the
+    /// extension is a public on-chain act anybody can audit.
+    public entry fun extend_deadline(
+        admin: &signer,
+        escrow_addr: address,
+        new_deadline: u64,
+    ) acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+
+        let escrow = borrow_global_mut<Escrow>(escrow_addr);
+        assert!(signer::address_of(admin) == escrow.admin, E_NOT_ADMIN);
+        assert!(option::is_some(&escrow.root), E_ROOT_NOT_PUBLISHED);
+        assert!(new_deadline > escrow.claim_deadline, E_DEADLINE_NOT_LATER);
+
+        let old_deadline = escrow.claim_deadline;
+        escrow.claim_deadline = new_deadline;
+
+        event::emit(DeadlineExtended {
+            escrow: escrow_addr,
+            old_deadline,
+            new_deadline,
+        });
     }
 
     /// Claim against the published root.
@@ -292,6 +464,20 @@ module grainlify_payout::escrow {
     /// Ordering is the security property: verify the proof, check the claimed
     /// marker, **set** the claimed marker, then transfer. Setting before the
     /// external call is what makes reentrancy uninteresting.
+    ///
+    /// **There is deliberately no deadline check here.** `claim_deadline` gates
+    /// the sweep, not the claim - it is the moment unclaimed funds *become
+    /// sweepable*, not the moment a contributor stops being owed.
+    ///
+    /// So a claimant arriving after the deadline is still paid in full, for as
+    /// long as nobody has swept. They are only ever cut off by the sweep actually
+    /// happening, which is a deliberate admin act rather than a clock ticking
+    /// over. Adding a deadline check here would move the cliff earlier and buy
+    /// nothing: the funds are sitting in escrow with that person's name on them.
+    ///
+    /// This is the single largest mitigation for the late-claimant case, and it
+    /// is a property of what is *absent* from this function, so it is easy to
+    /// destroy by adding one plausible-looking assertion.
     public entry fun claim(
         claimant: &signer,
         escrow_addr: address,
@@ -322,6 +508,7 @@ module grainlify_payout::escrow {
 
         // Mark before transferring.
         table::add(&mut escrow.claimed, leaf, true);
+        escrow.claimed_total = escrow.claimed_total + amount;
 
         let escrow_signer = object::generate_signer_for_extending(&escrow.extend_ref);
         let to = primary_fungible_store::ensure_primary_store_exists(
@@ -337,6 +524,122 @@ module grainlify_payout::escrow {
             amount,
             leaf,
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Sweeps
+    // -----------------------------------------------------------------------
+    //
+    // TWO FUNCTIONS, NOT ONE, AND THE SPLIT IS THE POINT.
+    //
+    // A settled escrow holds two pots of money with opposite risk profiles:
+    //
+    //   residue    = balance - root_total
+    //                Belongs to nobody. No leaf can claim it, so moving it
+    //                cannot harm any claimant under any circumstances.
+    //
+    //   unclaimed  = root_total - claimed_total
+    //                Belongs to named individuals who have not turned up.
+    //                Moving it takes money from a person.
+    //
+    // The Soroban contract has a single `sweep` that takes the whole balance, so
+    // these are one operation there. That is the mistake not being ported. It
+    // makes the completely safe operation inherit the dangerous one's timelock,
+    // and - worse - it normalises the dangerous one by association: "we sweep the
+    // escrow after settlement" sounds routine, and "we take unclaimed payouts
+    // from 38 named people" is the same sentence.
+
+    /// Return the surplus that no leaf can claim. No timelock.
+    ///
+    /// `balance - root_total` is provably unclaimable: the root commits to
+    /// `root_total` and nothing else, so no proof exists for a single unit above
+    /// it. There is therefore no argument for making anybody wait, and no way for
+    /// this to disadvantage a claimant.
+    ///
+    /// This is the ordinary operational case - somebody funded 3,000 and the tree
+    /// totalled 2,999.87 - and keeping it separate means that case never reaches
+    /// for the mechanism that can dispossess a contributor.
+    public entry fun sweep_residue(admin: &signer, escrow_addr: address) acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+
+        let escrow = borrow_global<Escrow>(escrow_addr);
+        assert!(signer::address_of(admin) == escrow.admin, E_NOT_ADMIN);
+        // Before publication there is no root_total, so every token in the
+        // escrow is potentially claimable and none of it is residue.
+        assert!(option::is_some(&escrow.root), E_ROOT_NOT_PUBLISHED);
+
+        let balance = fungible_asset::balance(escrow.store);
+        assert!(balance > escrow.root_total, E_NO_RESIDUE);
+        let amount = balance - escrow.root_total;
+
+        transfer_out(escrow, amount);
+
+        event::emit(SweptResidue {
+            escrow: escrow_addr,
+            amount,
+            dest: escrow.sweep_dest,
+        });
+    }
+
+    /// Return what nobody claimed, once the deadline has passed.
+    ///
+    /// This is the function that takes money from identified people, and every
+    /// constraint on it exists for that reason:
+    ///
+    /// * The destination was fixed at initialisation, before funding. There is no
+    ///   parameter, so the admin has no say in it at the moment of calling.
+    /// * The deadline was fixed at publication and can only ever have been moved
+    ///   *later*, so the admin cannot bring a cutoff forward.
+    /// * The amount is whatever remains. There is no per-leaf sweep, so nobody
+    ///   can be singled out.
+    ///
+    /// **The root and the claimed markers are left intact**, which matters more
+    /// than it looks. After a sweep, `is_claimed` still answers correctly and
+    /// `root` is still readable, so a late claimant holding their proof can
+    /// demonstrate from chain state alone exactly what they were owed - without
+    /// needing to be believed, and without trusting our database. That is what
+    /// makes any off-chain remedy possible at all.
+    ///
+    /// There is deliberately **no claim-rate floor**. A rule refusing to sweep
+    /// below some fraction was considered and rejected: it can permanently trap
+    /// funds in a way nobody can undo, and it hard-codes a judgement that a person
+    /// looking at a bad claim rate can make better. The remedy for a low claim
+    /// rate is to extend the deadline and chase people, which the emitted
+    /// shortfall below makes visible enough to act on.
+    public entry fun sweep_unclaimed(admin: &signer, escrow_addr: address) acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+
+        let escrow = borrow_global<Escrow>(escrow_addr);
+        assert!(signer::address_of(admin) == escrow.admin, E_NOT_ADMIN);
+        assert!(option::is_some(&escrow.root), E_ROOT_NOT_PUBLISHED);
+        assert!(timestamp::now_seconds() >= escrow.claim_deadline, E_CLAIM_WINDOW_OPEN);
+
+        let amount = fungible_asset::balance(escrow.store);
+        assert!(amount > 0, E_NO_RESIDUE);
+
+        transfer_out(escrow, amount);
+
+        event::emit(SweptUnclaimed {
+            escrow: escrow_addr,
+            amount,
+            root_total: escrow.root_total,
+            claimed_total: escrow.claimed_total,
+            dest: escrow.sweep_dest,
+        });
+    }
+
+    /// Move funds out of the escrow store to the fixed destination.
+    ///
+    /// Takes no destination argument, and is private, so there is exactly one
+    /// address any sweep can ever pay: the one recorded at initialisation.
+    fun transfer_out(escrow: &Escrow, amount: u64) {
+        let escrow_signer = object::generate_signer_for_extending(&escrow.extend_ref);
+        let to = primary_fungible_store::ensure_primary_store_exists(
+            escrow.sweep_dest,
+            escrow.metadata,
+        );
+        let fa = dispatchable_fungible_asset::withdraw(&escrow_signer, escrow.store, amount);
+        dispatchable_fungible_asset::deposit(to, fa);
     }
 
     // -----------------------------------------------------------------------
@@ -377,6 +680,47 @@ module grainlify_payout::escrow {
     public fun event_id(escrow_addr: address): vector<u8> acquires Escrow {
         assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
         borrow_global<Escrow>(escrow_addr).event_id
+    }
+
+    #[view]
+    /// When unclaimed funds become sweepable. Zero before publication.
+    ///
+    /// A view rather than event-only, so the claim page can show an absolute date
+    /// and a contributor can verify it against the chain themselves instead of
+    /// taking our word for it. If somebody can lose a real payout to a date, that
+    /// date has to be readable by them.
+    public fun claim_deadline(escrow_addr: address): u64 acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+        borrow_global<Escrow>(escrow_addr).claim_deadline
+    }
+
+    #[view]
+    /// Everything claimed so far. With `root_total`, this is the live shortfall -
+    /// the number to look at before deciding whether to sweep or to extend.
+    public fun claimed_total(escrow_addr: address): u64 acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+        borrow_global<Escrow>(escrow_addr).claimed_total
+    }
+
+    #[view]
+    /// Where a sweep would send funds. Readable from creation, so it can be
+    /// checked before anybody commits work rather than discovered afterwards.
+    public fun sweep_dest(escrow_addr: address): address acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+        borrow_global<Escrow>(escrow_addr).sweep_dest
+    }
+
+    #[view]
+    public fun claim_window(escrow_addr: address): u64 acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+        borrow_global<Escrow>(escrow_addr).claim_window
+    }
+
+    #[view]
+    /// The agreed 24-month default, exposed so a deployer can pass it without
+    /// transcribing a number of seconds.
+    public fun recommended_claim_window(): u64 {
+        RECOMMENDED_CLAIM_WINDOW
     }
 
     #[view]

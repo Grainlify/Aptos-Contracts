@@ -456,6 +456,31 @@ module grainlify_payout::escrow {
 
     /// Claim against the published root.
     ///
+    /// # DO NOT ADD A DEADLINE CHECK TO THIS FUNCTION
+    ///
+    /// Enforced by `escrow_tests::a_claim_after_the_deadline_still_pays_until_the_sweep`.
+    /// If you are here because that test is failing, the test is right and the
+    /// change is wrong.
+    ///
+    /// The omission is the design, not an oversight. `claim_deadline` gates the
+    /// *sweep*, not the claim: it is the moment unclaimed funds become
+    /// **sweepable**, never the moment a contributor stops being owed. So a
+    /// claimant arriving after the deadline is paid in full for as long as nobody
+    /// has swept, and the cutoff is a deliberate admin act rather than a clock
+    /// ticking over.
+    ///
+    /// That distinction is the single largest protection a late claimant has. An
+    /// `assert!(now < claim_deadline)` here would look like tightening a loose
+    /// end and would instead create the cliff this design exists to avoid -
+    /// taking money from somebody whose funds are sitting in escrow with their
+    /// name on them, for the sake of a date they may never have seen.
+    ///
+    /// A property that lives in what a function does *not* assert is the most
+    /// fragile kind there is, which is why it is stated here rather than only in
+    /// the README, and why the test that enforces it is named above.
+    ///
+    /// # The rest
+    ///
     /// The contributor submits this themselves and pays their own gas, so their
     /// address reaches the chain only by their own action. The leaf commits to a
     /// salted hash of their identity beside the address, never the identity
@@ -464,20 +489,6 @@ module grainlify_payout::escrow {
     /// Ordering is the security property: verify the proof, check the claimed
     /// marker, **set** the claimed marker, then transfer. Setting before the
     /// external call is what makes reentrancy uninteresting.
-    ///
-    /// **There is deliberately no deadline check here.** `claim_deadline` gates
-    /// the sweep, not the claim - it is the moment unclaimed funds *become
-    /// sweepable*, not the moment a contributor stops being owed.
-    ///
-    /// So a claimant arriving after the deadline is still paid in full, for as
-    /// long as nobody has swept. They are only ever cut off by the sweep actually
-    /// happening, which is a deliberate admin act rather than a clock ticking
-    /// over. Adding a deadline check here would move the cliff earlier and buy
-    /// nothing: the funds are sitting in escrow with that person's name on them.
-    ///
-    /// This is the single largest mitigation for the late-claimant case, and it
-    /// is a property of what is *absent* from this function, so it is easy to
-    /// destroy by adding one plausible-looking assertion.
     public entry fun claim(
         claimant: &signer,
         escrow_addr: address,

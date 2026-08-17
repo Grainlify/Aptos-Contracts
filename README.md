@@ -109,6 +109,45 @@ deadline somebody can miss. Four things reduce the harm:
 taken), so what was removed from people is public record rather than an internal
 number.
 
+### Copy for the terms and the claim page — the obvious wording is false
+
+Whoever writes the contributor-facing copy will reach for a deadline sentence, and
+the natural one is a lie. Inherit this instead.
+
+**Wrong:**
+
+> Claim your reward by 12 March 2028 or you will lose it.
+
+That is not what the contract does. Nothing expires on that date. A claim
+submitted on 13 March pays in full, and so does one submitted a year later, right
+up until somebody calls `sweep_unclaimed`. Telling people otherwise frightens them
+with a cliff that does not exist — and worse, it teaches anyone who misses the date
+that they have already lost, so they never ask, and a claim that would still have
+paid goes unmade.
+
+**Right:**
+
+> Your reward has no expiry date. From 12 March 2028 we may return unclaimed
+> funds to the Grainlify treasury — and until we actually do, your claim still
+> pays in full. If you have missed the date, contact us: while the funds are
+> still in escrow we can extend the window for you.
+
+Three things that copy has to carry, and the third is the one usually dropped:
+
+1. **The date is when we *may* sweep**, not when the claim stops working.
+2. **Until the sweep happens, the claim pays in full.**
+3. **Missing the date is recoverable while the funds remain**, by asking. That is
+   `extend_deadline`, and it is a real remedy rather than a courtesy.
+
+And a placement requirement that is not the contract's business but decides
+whether any of this matters: **the date has to be in front of the person, not in
+the terms.** In the claim page, in the notification that tells them they are owed
+something, and again as it approaches. A deadline that only exists in a document
+nobody reads is precisely how the missed-claim case happens.
+
+Anyone can verify the date themselves against the chain via `claim_deadline()`,
+which is a view for exactly that reason.
+
 ### No claim-rate floor
 
 A rule refusing to sweep below some claimed fraction was considered and rejected.

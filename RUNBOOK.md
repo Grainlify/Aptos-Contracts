@@ -66,6 +66,10 @@ missing.
    consciously to publish without them. Someone omitted from a root cannot be
    added — the root is write-once. Get the list of eligible-but-address-less
    contributors and look at it.
+
+   Their money must **not** be funded into this escrow. See Phase 2: an omitted
+   contributor's share is indistinguishable from residue, and residue has no
+   timelock.
 3. **The salt exists and is stored.** Leaves commit to
    `sha256(github_login || salt)`.
 
@@ -127,8 +131,25 @@ fund(sponsor, escrow_addr, amount)
 Anyone may fund. Amounts are minor units — 6 decimals for USDC, so 3,000 USDC is
 `3_000_000_000`.
 
-Fund **at least** the tree total. Funding more is fine and the surplus is
-recoverable through `sweep_residue`; funding less means `publish_root` will abort.
+**Fund exactly the tree total — not the pool total, and not more.**
+
+Funding less means `publish_root` aborts, which is loud and harmless. Funding
+*more* is the dangerous direction, and the reason is not obvious:
+
+> `sweep_residue` returns `balance − root_total` with **no timelock**, on the
+> grounds that no leaf can claim it and so it belongs to nobody. That is only
+> true if the tree contains every person entitled to a share.
+
+An eligible contributor who has not registered an address **cannot be in the
+tree**, but the settlement still computed an amount for them. If you fund the
+full pool, that person's money sits in the escrow looking exactly like residue —
+sweepable immediately, with no deadline and no notice. The one protection the
+design gives an absent claimant, the claim window, does not apply to it.
+
+So the money for contributors without addresses stays in the treasury, earmarked
+off-chain, and never enters this escrow. Fund the leaf total and residue is zero,
+which makes `sweep_residue` abort with `E_NO_RESIDUE` and the mistake structurally
+unreachable.
 
 **Aborts:** `E_ALREADY_SETTLED` once a root is published. Top-ups after
 publication are refused, because they could only create a surplus no leaf accounts

@@ -451,8 +451,30 @@ module grainlify_payout::escrow {
         // total", and this is that rule enforced rather than remembered. The
         // runbook is now the explanation; this is the protection.
         //
-        // Compared against `funded_total` rather than the store balance because
-        // deposits are permissionless - see the field's own comment.
+        // ---------------------------------------------------------------
+        // DO NOT CHANGE THIS TO COMPARE THE STORE BALANCE.
+        //
+        // `fungible_asset::balance(escrow.store)` is the obvious thing to
+        // compare against, reads more simply, and removes a field. It is a
+        // denial-of-service.
+        //
+        // `dispatchable_fungible_asset::deposit` is declared
+        //
+        //     public fun deposit<T: key>(store: Object<T>, fa: FungibleAsset)
+        //
+        // with **no signer**. Anybody can push tokens into this escrow's store
+        // without going through `fund`. Against a balance comparison, one
+        // unsolicited unit makes this assertion permanently unsatisfiable - and
+        // there is no way out, because `fund` is refused after publication and
+        // `sweep_residue` requires a published root. The escrow is dead, its
+        // funds are frozen forever, and the attack costs one token.
+        //
+        // Tracking what we funded makes a stranger's deposit irrelevant:
+        // publication proceeds and the dust lands in residue, where it is swept
+        // like any other surplus.
+        //
+        // Enforced by `an_unsolicited_deposit_cannot_block_publication`.
+        // ---------------------------------------------------------------
         assert!(total == escrow.funded_total, E_ROOT_TOTAL_NOT_FUNDED);
 
         // Unreachable while funded_total is accounted correctly, since the store

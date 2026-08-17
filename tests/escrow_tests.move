@@ -121,13 +121,16 @@ module grainlify_payout::escrow_tests {
     fun funding_credits_the_escrow(aptos_framework: &signer, admin: &signer) {
         let f = setup(aptos_framework, admin, 1_000_000);
         assert!(escrow::balance(f.escrow_addr) == 1_000_000, 0);
-        assert!(option::is_none(&escrow::root(f.escrow_addr)), 1);
-        assert!(escrow::event_id(f.escrow_addr) == EVENT_ID, 2);
+        // Funded through fund(), so both figures agree here. They diverge only
+        // when somebody deposits into the store directly.
+        assert!(escrow::funded_total(f.escrow_addr) == 1_000_000, 1);
+        assert!(option::is_none(&escrow::root(f.escrow_addr)), 2);
+        assert!(escrow::event_id(f.escrow_addr) == EVENT_ID, 3);
     }
 
     #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     fun publish_root_records_the_root_and_total(aptos_framework: &signer, admin: &signer) {
-        let f = setup(aptos_framework, admin, 1_000_000);
+        let f = setup(aptos_framework, admin, 600_000);
         let root = tree_vectors::root_3();
         escrow::publish_root(admin, f.escrow_addr, root, 600_000);
 
@@ -140,24 +143,106 @@ module grainlify_payout::escrow_tests {
     #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 6, location = grainlify_payout::escrow)]
     fun a_root_cannot_be_republished(aptos_framework: &signer, admin: &signer) {
-        let f = setup(aptos_framework, admin, 1_000_000);
+        let f = setup(aptos_framework, admin, 600_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 600_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_5(), 100_000);
     }
 
     // Refused rather than accepted-and-stranded: the last claimants would find
     // nothing left, having been told on-chain they were owed it.
+    //
+    // Aborts on the funded-total check rather than the balance check, because
+    // that check comes first and names the more useful pair of figures.
     #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
-    #[expected_failure(abort_code = 4, location = grainlify_payout::escrow)]
+    #[expected_failure(abort_code = 16, location = grainlify_payout::escrow)]
     fun a_root_larger_than_the_escrow_is_refused(aptos_framework: &signer, admin: &signer) {
         let f = setup(aptos_framework, admin, 500_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 500_001);
     }
 
+    // THE GUARD. Funding the pool total where the leaf total was meant is the
+    // mistake this exists for, and it is the one an operator can make while
+    // reading the runbook and still get wrong.
+    //
+    // Overfunding used to publish happily and leave the difference as residue -
+    // which sweep_residue returns with NO timelock, on the grounds that it
+    // belongs to nobody. It does not belong to nobody: it is the share of an
+    // eligible contributor who has not registered an address, and the claim
+    // window is their only protection.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 16, location = grainlify_payout::escrow)]
+    fun publishing_a_root_smaller_than_what_was_funded_is_refused(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        // Funded the pool total; the tree only totals 250_000 because somebody
+        // has no address.
+        let f = setup(aptos_framework, admin, 300_000);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 250_000);
+    }
+
+    // Exactly equal is the only accepted case, from the passing side.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun publishing_a_root_equal_to_what_was_funded_succeeds(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        assert!(escrow::funded_total(f.escrow_addr) == 300_000, 0);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+        assert!(escrow::root_total(f.escrow_addr) == 300_000, 1);
+    }
+
+    // funded_total accumulates across calls, so funding in instalments is fine
+    // and the guard compares against the sum rather than the last transfer.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun funding_in_instalments_sums_to_the_publishable_total(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 100_000);
+        test_asset::mint(admin, f.admin_addr, 200_000);
+        escrow::fund(admin, f.escrow_addr, 200_000);
+        assert!(escrow::funded_total(f.escrow_addr) == 300_000, 0);
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+    }
+
+    // THE GRIEFING CASE, and the reason the guard reads funded_total rather than
+    // the store balance.
+    //
+    // dispatchable_fungible_asset::deposit takes no signer, so anybody can push
+    // tokens into this escrow's store without going through fund(). Had
+    // publish_root compared against the balance, one unsolicited unit would block
+    // publication permanently: fund() is refused after publication and
+    // sweep_residue needs a published root, so nothing could clear the dust.
+    //
+    // Here a stranger deposits, publication proceeds unaffected, and the dust
+    // ends up in residue where it is swept like any other surplus.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun an_unsolicited_deposit_cannot_block_publication(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+
+        // A stranger pushes dust straight into the escrow's store.
+        let stranger = account_at(@0xD057);
+        test_asset::mint(admin, signer::address_of(&stranger), 7);
+        test_asset::deposit_into(&stranger, f.escrow_addr, 7);
+
+        // The balance moved; what we funded did not.
+        assert!(escrow::balance(f.escrow_addr) == 300_007, 0);
+        assert!(escrow::funded_total(f.escrow_addr) == 300_000, 1);
+
+        // Publication is unaffected.
+        escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 300_000);
+
+        // And the dust is ordinary residue.
+        escrow::sweep_residue(admin, f.escrow_addr);
+        assert!(test_asset::balance_of(SWEEP_DEST, f.metadata) == 7, 2);
+        assert!(escrow::balance(f.escrow_addr) == 300_000, 3);
+    }
+
     #[test(aptos_framework = @aptos_framework, admin = @0xA11CE, stranger = @0xBEEF)]
     #[expected_failure(abort_code = 3, location = grainlify_payout::escrow)]
     fun only_the_admin_may_publish(aptos_framework: &signer, admin: &signer, stranger: &signer) {
-        let f = setup(aptos_framework, admin, 1_000_000);
+        let f = setup(aptos_framework, admin, 600_000);
         escrow::publish_root(stranger, f.escrow_addr, tree_vectors::root_3(), 600_000);
     }
 
@@ -166,7 +251,7 @@ module grainlify_payout::escrow_tests {
     #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     #[expected_failure(abort_code = 11, location = grainlify_payout::escrow)]
     fun funding_after_publication_is_refused(aptos_framework: &signer, admin: &signer) {
-        let f = setup(aptos_framework, admin, 1_000_000);
+        let f = setup(aptos_framework, admin, 600_000);
         escrow::publish_root(admin, f.escrow_addr, tree_vectors::root_3(), 600_000);
         test_asset::mint(admin, f.admin_addr, 1);
         escrow::fund(admin, f.escrow_addr, 1);
@@ -501,14 +586,23 @@ module grainlify_payout::escrow_tests {
 
     // Residue is sweepable immediately, and cannot touch what the root promised.
     //
-    // The strong form of the assertion: fund ABOVE the root, sweep the residue,
-    // then claim every leaf successfully. If sweep_residue ever reached into
-    // root_total, the last claim would fail for want of balance.
+    // Note how the residue has to be created: by an unsolicited deposit, not by
+    // overfunding. Since publish_root requires total == funded_total, our own
+    // funding can no longer produce a surplus - so residue is now, by
+    // construction, only ever money nobody deliberately put in. That is a
+    // stronger guarantee than the one this test was originally written for.
+    //
+    // The strong form of the assertion: create a surplus, sweep it, then claim
+    // every leaf successfully. If sweep_residue ever reached into root_total, the
+    // last claim would fail for want of balance.
     #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
     fun sweep_residue_cannot_touch_what_the_root_promised(
         aptos_framework: &signer, admin: &signer,
     ) {
-        let f = setup(aptos_framework, admin, 350_000);
+        let f = setup(aptos_framework, admin, 300_000);
+        let stranger = account_at(@0xD057);
+        test_asset::mint(admin, signer::address_of(&stranger), 50_000);
+        test_asset::deposit_into(&stranger, f.escrow_addr, 50_000);
         let a = account_at(@0xAAA1);
         let b = account_at(@0xBBB2);
         let id_a = id(0x0A);
@@ -517,7 +611,7 @@ module grainlify_payout::escrow_tests {
         let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
         let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
         let root = escrow::hash_node_for_test(leaf_a, leaf_b);
-        // Funded 350_000 against a root of 300_000: 50_000 is residue.
+        // Funded 300_000, plus 50_000 of unsolicited dust: that dust is residue.
         escrow::publish_root(admin, f.escrow_addr, root, 300_000);
 
         escrow::sweep_residue(admin, f.escrow_addr);

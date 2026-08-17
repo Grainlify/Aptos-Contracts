@@ -133,8 +133,13 @@ Anyone may fund. Amounts are minor units — 6 decimals for USDC, so 3,000 USDC 
 
 **Fund exactly the tree total — not the pool total, and not more.**
 
-Funding less means `publish_root` aborts, which is loud and harmless. Funding
-*more* is the dangerous direction, and the reason is not obvious:
+**The contract enforces this**, so it is not something you have to remember:
+`publish_root` aborts with `E_ROOT_TOTAL_NOT_FUNDED` unless `total` equals what
+was funded, and the abort names both figures. What follows is the explanation,
+not the protection.
+
+Funding less means it aborts, which is loud and harmless. Funding *more* is the
+direction that used to be dangerous, and the reason is not obvious:
 
 > `sweep_residue` returns `balance − root_total` with **no timelock**, on the
 > grounds that no leaf can claim it and so it belongs to nobody. That is only
@@ -147,9 +152,18 @@ sweepable immediately, with no deadline and no notice. The one protection the
 design gives an absent claimant, the claim window, does not apply to it.
 
 So the money for contributors without addresses stays in the treasury, earmarked
-off-chain, and never enters this escrow. Fund the leaf total and residue is zero,
-which makes `sweep_residue` abort with `E_NO_RESIDUE` and the mistake structurally
-unreachable.
+off-chain, and never enters this escrow.
+
+One consequence worth knowing, because it makes `sweep_residue` safer than it was
+designed to be: since the root must equal what was funded, **our own funding can
+no longer produce a surplus at all**. Residue is now, by construction, only ever
+money somebody deposited into the store without going through `fund` — so it can
+never contain a contributor's share.
+
+The check compares against what was funded rather than the store balance, because
+`dispatchable_fungible_asset::deposit` takes no signer: anybody can push tokens
+into the escrow's store. Comparing against the balance would let one unsolicited
+unit block publication permanently.
 
 **Aborts:** `E_ALREADY_SETTLED` once a root is published. Top-ups after
 publication are refused, because they could only create a surplus no leaf accounts
@@ -252,7 +266,8 @@ escrow is already empty; `E_NOT_ADMIN`.
 
 | Symptom | Cause | Remedy |
 | --- | --- | --- |
-| `publish_root` aborts 4 | `total > balance` | Fund the difference, then publish. |
+| `publish_root` aborts 16 | `total` is not what was funded | Compare the two figures the abort names. Funding the pool total where the leaf total was meant is the usual cause. |
+| `publish_root` aborts 4 | `total > balance` | Should be unreachable — abort 16 fires first. If you see it, `funded_total` accounting is wrong; stop and investigate. |
 | `publish_root` aborts 6 | A root already exists | None for this escrow. Correction means a new escrow under a different `event_id`. |
 | `initialise` aborts 12 | Window below 30 days | Almost certainly a units slip. Check seconds versus days. |
 | A contributor cannot claim | Proof built against a different tree, or a different address | Rebuild their proof from the stored leaf set. Check the address matches the one in the leaf **byte for byte** — Aptos addresses have several valid spellings and the leaf commits to the 32 raw bytes. |

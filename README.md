@@ -32,7 +32,7 @@ and pushing requires holding everyone's address at once.
 | --- | --- | --- |
 | `initialise` | admin | One escrow per `(admin, event_id)`. Fixes the sweep destination and claim window |
 | `fund` | anyone | Refused once a root is published |
-| `publish_root` | admin | Once per event, permanently. Refuses `total > balance`. Starts the claim clock |
+| `publish_root` | admin | Once per event, permanently. Requires `total == funded_total`. Starts the claim clock |
 | `claim` | the claimant | Verifies a proof, marks claimed, then transfers. **No deadline check** |
 | `extend_deadline` | admin | Can only move the deadline **later** |
 | `sweep_residue` | admin | Returns `balance − root_total` only. No timelock |
@@ -58,7 +58,7 @@ port.
 
 | Pot | Amount | Belongs to | Risk of moving it |
 | --- | --- | --- | --- |
-| Residue | `balance − root_total` | Nobody — no leaf can claim it | None whatsoever |
+| Residue | `balance − root_total` | Nobody — and since `publish_root` requires `total == funded_total`, this can only ever be an unsolicited deposit | None whatsoever |
 | Unclaimed | `root_total − claimed_total` | Named individuals who have not turned up | Taking money from a person |
 
 Conflating them makes the safe operation inherit the dangerous one's timelock,

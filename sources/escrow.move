@@ -126,6 +126,10 @@ module grainlify_payout::escrow {
     const E_CLAIM_WINDOW_OPEN: u64 = 14;
     /// Nothing to sweep.
     const E_NO_RESIDUE: u64 = 15;
+    /// The root does not commit to exactly what was funded. Almost always means
+    /// the pool total was funded where the leaf total was meant, which would put
+    /// an address-less contributor's share into no-timelock residue.
+    const E_ROOT_TOTAL_NOT_FUNDED: u64 = 16;
 
     // -----------------------------------------------------------------------
     // State
@@ -163,6 +167,21 @@ module grainlify_payout::escrow {
         /// Claimed markers keyed by leaf digest. A table rather than a vector
         /// so claim cost does not grow with the number of claimants.
         claimed: Table<vector<u8>, bool>,
+        /// Everything moved in through `fund`, and nothing else.
+        ///
+        /// **Deliberately not the store balance.** `dispatchable_fungible_asset::deposit`
+        /// is a public function taking no signer, so anybody can push tokens
+        /// into this escrow's store without going through `fund`. If
+        /// `publish_root` compared the root total against the *balance*, one
+        /// unsolicited unit would block publication permanently - `fund` is
+        /// refused after publication and `sweep_residue` needs a published root,
+        /// so there would be no way to clear the dust. A griefing deadlock for
+        /// the price of one token.
+        ///
+        /// Tracking what we funded makes the check immune to that: a stranger's
+        /// deposit does not move this number, publication proceeds, and the dust
+        /// lands in residue where it is swept like any other surplus.
+        funded_total: u64,
         /// Running sum of everything claimed.
         ///
         /// Maintained rather than derived, because a table's values cannot be
@@ -335,6 +354,7 @@ module grainlify_payout::escrow {
             extend_ref,
             root: option::none<vector<u8>>(),
             root_total: 0,
+            funded_total: 0,
             claimed: table::new<vector<u8>, bool>(),
             claimed_total: 0,
             sweep_dest,
@@ -367,7 +387,7 @@ module grainlify_payout::escrow {
         assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
         assert!(amount > 0, E_INVALID_AMOUNT);
 
-        let escrow = borrow_global<Escrow>(escrow_addr);
+        let escrow = borrow_global_mut<Escrow>(escrow_addr);
         assert!(option::is_none(&escrow.root), E_ALREADY_SETTLED);
 
         let from = primary_fungible_store::ensure_primary_store_exists(
@@ -382,6 +402,7 @@ module grainlify_payout::escrow {
         // fungible asset, so `fungible_asset::transfer` would abort on every
         // real transfer while passing every test against a plain test token.
         dispatchable_fungible_asset::transfer(sponsor, from, escrow.store, amount);
+        escrow.funded_total = escrow.funded_total + amount;
 
         event::emit(Funded {
             escrow: escrow_addr,
@@ -415,6 +436,29 @@ module grainlify_payout::escrow {
         let escrow = borrow_global_mut<Escrow>(escrow_addr);
         assert!(signer::address_of(admin) == escrow.admin, E_NOT_ADMIN);
         assert!(option::is_none(&escrow.root), E_ROOT_ALREADY_PUBLISHED);
+
+        // The root must commit to exactly what was funded - not at most.
+        //
+        // `total < funded_total` is the dangerous direction and the reason this
+        // check exists. An eligible contributor with no registered address
+        // cannot be in the tree, but the off-chain settlement still computed an
+        // amount for them. Funding the whole pool would leave their share in the
+        // escrow as `balance - root_total`, which is precisely what
+        // `sweep_residue` treats as belonging to nobody and returns with **no
+        // timelock**. Their one protection, the claim window, would not apply.
+        //
+        // So the operational rule is "fund the leaf total, never the pool
+        // total", and this is that rule enforced rather than remembered. The
+        // runbook is now the explanation; this is the protection.
+        //
+        // Compared against `funded_total` rather than the store balance because
+        // deposits are permissionless - see the field's own comment.
+        assert!(total == escrow.funded_total, E_ROOT_TOTAL_NOT_FUNDED);
+
+        // Unreachable while funded_total is accounted correctly, since the store
+        // only ever grows before publication. Kept as the invariant that would
+        // catch a bug in that accounting, which is the one thing the check above
+        // cannot detect on its own.
         assert!(total <= fungible_asset::balance(escrow.store), E_INSUFFICIENT_ESCROW);
 
         escrow.root = option::some(root);
@@ -737,6 +781,22 @@ module grainlify_payout::escrow {
     public fun claim_deadline(escrow_addr: address): u64 acquires Escrow {
         assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
         borrow_global<Escrow>(escrow_addr).claim_deadline
+    }
+
+    #[test_only]
+    /// The escrow's fungible store, so a test can simulate the permissionless
+    /// deposit anybody can perform against it. Test-only because production has
+    /// no reason to reach past the module for it.
+    public fun escrow_store(escrow_addr: address): Object<FungibleStore> acquires Escrow {
+        borrow_global<Escrow>(escrow_addr).store
+    }
+
+    #[view]
+    /// Everything moved in through `fund`. Not the store balance, which can also
+    /// contain unsolicited deposits.
+    public fun funded_total(escrow_addr: address): u64 acquires Escrow {
+        assert!(exists<Escrow>(escrow_addr), E_NOT_INITIALISED);
+        borrow_global<Escrow>(escrow_addr).funded_total
     }
 
     #[view]

@@ -205,6 +205,13 @@ The tests mint their own hookless asset, which means they prove the calls are
 well-formed and prove nothing about hook interaction. A deny-listed claimant or a
 paused asset is a testnet rehearsal concern.
 
+## Operating one
+
+See [RUNBOOK.md](RUNBOOK.md) for the full sequence and, more importantly, for what
+each step locks permanently. The short version: `publish_root` is the point of no
+return for shortening a claim window, because `extend_deadline` can only move a
+deadline later.
+
 ## Building and testing
 
 Requires the Aptos CLI.

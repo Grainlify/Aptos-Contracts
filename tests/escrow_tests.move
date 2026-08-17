@@ -15,9 +15,10 @@ module grainlify_payout::escrow_tests {
 
     const EVENT_ID: vector<u8> = b"founding-pool-2026";
     const SWEEP_DEST: address = @0x5EED;
-    // A short window keeps the tests readable. Real events use
-    // escrow::recommended_claim_window() (24 months) or longer.
-    const WINDOW: u64 = 1000;
+    // Exactly MINIMUM_CLAIM_WINDOW (30 days), so every test that publishes a
+    // root also exercises the floor's boundary as an accepted value. Real events
+    // use escrow::recommended_claim_window() (24 months) or longer.
+    const WINDOW: u64 = 2592000;
     // Genesis-ish start so deadline arithmetic is not near zero.
     const T0: u64 = 1_000_000;
 
@@ -369,6 +370,132 @@ module grainlify_payout::escrow_tests {
     }
 
     // -----------------------------------------------------------------------
+    // What a claim must NOT touch
+    // -----------------------------------------------------------------------
+
+    // claim() takes borrow_global_mut, because claimed_total is maintained.
+    //
+    // That is a real loss. When it held an immutable borrow, the type system
+    // guaranteed for free that a claim could not alter the root, the deadline, the
+    // sweep destination or anybody else's claimed marker. Now nothing prevents it
+    // but the code being right, so the guarantee has to be asserted explicitly
+    // rather than left implied by the behaviour tests.
+    //
+    // Everything a claim is permitted to change: the claimant's balance, the
+    // escrow balance, that leaf's marker, and claimed_total. Everything else is
+    // snapshotted here and compared afterwards.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun a_claim_changes_nothing_it_has_no_business_changing(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 600_000);
+
+        let a = account_at(@0xAAA1);
+        let b = account_at(@0xBBB2);
+        let c = account_at(@0xCCC3);
+        let id_a = id(0x0A);
+        let id_b = id(0x0B);
+        let id_c = id(0x0C);
+
+        let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
+        let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
+        let leaf_c = escrow::leaf_for(signer::address_of(&c), id_c, 300_000);
+
+        let leaves = vector::empty<vector<u8>>();
+        vector::push_back(&mut leaves, leaf_a);
+        vector::push_back(&mut leaves, leaf_b);
+        vector::push_back(&mut leaves, leaf_c);
+        let sorted = tree_vectors::sort_digests(leaves);
+        let root = tree_vectors::root_from_digests(leaves);
+
+        escrow::publish_root(admin, f.escrow_addr, root, 600_000);
+
+        // Snapshot everything a claim has no business altering.
+        let root_before = escrow::root(f.escrow_addr);
+        let root_total_before = escrow::root_total(f.escrow_addr);
+        let deadline_before = escrow::claim_deadline(f.escrow_addr);
+        let dest_before = escrow::sweep_dest(f.escrow_addr);
+        let window_before = escrow::claim_window(f.escrow_addr);
+        let event_id_before = escrow::event_id(f.escrow_addr);
+
+        // Claim the leaf that sorts first, whichever entitlement that turns out
+        // to be. Its path crosses the promoted node.
+        let target = *vector::borrow(&sorted, 0);
+        let proof = vector::empty<vector<u8>>();
+        vector::push_back(&mut proof, *vector::borrow(&sorted, 1));
+        vector::push_back(&mut proof, *vector::borrow(&sorted, 2));
+        let (claimant, identity, amount) = if (target == leaf_a) {
+            (&a, id_a, 100_000u64)
+        } else if (target == leaf_b) {
+            (&b, id_b, 200_000u64)
+        } else {
+            (&c, id_c, 300_000u64)
+        };
+
+        escrow::claim(claimant, f.escrow_addr, identity, amount, proof);
+
+        // The published commitment is untouched.
+        assert!(escrow::root(f.escrow_addr) == root_before, 0);
+        assert!(escrow::root_total(f.escrow_addr) == root_total_before, 1);
+
+        // The sweep terms are untouched. A claim that could move the deadline or
+        // redirect the destination would hand a claimant the admin's only powers.
+        assert!(escrow::claim_deadline(f.escrow_addr) == deadline_before, 2);
+        assert!(escrow::sweep_dest(f.escrow_addr) == dest_before, 3);
+        assert!(escrow::claim_window(f.escrow_addr) == window_before, 4);
+
+        assert!(escrow::event_id(f.escrow_addr) == event_id_before, 5);
+
+        // No OTHER leaf became claimed. This is the one that matters most: a
+        // claim marking somebody else's leaf would lock a legitimate claimant out
+        // permanently, and the root cannot be republished to fix it.
+        let i = 0;
+        while (i < 3) {
+            let leaf = *vector::borrow(&sorted, i);
+            let want_claimed = leaf == target;
+            assert!(escrow::is_claimed(f.escrow_addr, leaf) == want_claimed, 6);
+            i = i + 1;
+        };
+
+        // And only the claimed amount left the escrow.
+        assert!(escrow::balance(f.escrow_addr) == 600_000 - amount, 7);
+        assert!(escrow::claimed_total(f.escrow_addr) == amount, 8);
+    }
+
+    // The same invariant across two claims, because a single claim cannot show
+    // that the second one leaves the first one's marker alone.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun a_second_claim_leaves_the_first_ones_marker_alone(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+        let a = account_at(@0xAAA1);
+        let b = account_at(@0xBBB2);
+        let id_a = id(0x0A);
+        let id_b = id(0x0B);
+
+        let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
+        let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
+        let root = escrow::hash_node_for_test(leaf_a, leaf_b);
+        escrow::publish_root(admin, f.escrow_addr, root, 300_000);
+        let deadline_before = escrow::claim_deadline(f.escrow_addr);
+
+        let pa = vector::empty<vector<u8>>();
+        vector::push_back(&mut pa, leaf_b);
+        escrow::claim(&a, f.escrow_addr, id_a, 100_000, pa);
+
+        let pb = vector::empty<vector<u8>>();
+        vector::push_back(&mut pb, leaf_a);
+        escrow::claim(&b, f.escrow_addr, id_b, 200_000, pb);
+
+        assert!(escrow::is_claimed(f.escrow_addr, leaf_a), 0);
+        assert!(escrow::is_claimed(f.escrow_addr, leaf_b), 1);
+        assert!(escrow::claimed_total(f.escrow_addr) == 300_000, 2);
+        assert!(escrow::claim_deadline(f.escrow_addr) == deadline_before, 3);
+        assert!(escrow::root_total(f.escrow_addr) == 300_000, 4);
+    }
+
+    // -----------------------------------------------------------------------
     // Sweeps
     // -----------------------------------------------------------------------
 
@@ -601,6 +728,51 @@ module grainlify_payout::escrow_tests {
         timestamp::set_time_has_started_for_testing(aptos_framework);
         let metadata = test_asset::create(admin);
         escrow::initialise(admin, EVENT_ID, metadata, SWEEP_DEST, 0);
+    }
+
+    // The mistake the floor exists for: 30 meaning thirty DAYS, passed as thirty
+    // seconds. Nothing else in the system would catch it, and it would publish a
+    // root that became sweepable almost immediately - no cliff anybody could see,
+    // and a sweep that looked entirely legitimate on chain.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 12, location = grainlify_payout::escrow)]
+    fun a_seconds_for_days_units_slip_is_refused(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        timestamp::set_time_has_started_for_testing(aptos_framework);
+        let metadata = test_asset::create(admin);
+        escrow::initialise(admin, EVENT_ID, metadata, SWEEP_DEST, 30);
+    }
+
+    // One second below the floor, to pin the boundary from the failing side.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    #[expected_failure(abort_code = 12, location = grainlify_payout::escrow)]
+    fun a_window_one_second_below_the_floor_is_refused(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        timestamp::set_time_has_started_for_testing(aptos_framework);
+        let metadata = test_asset::create(admin);
+        escrow::initialise(admin, EVENT_ID, metadata, SWEEP_DEST, escrow::minimum_claim_window() - 1);
+    }
+
+    // And the floor itself is accepted, so it is a floor and not a threshold one
+    // above it. Every other test in this file relies on this, since WINDOW is
+    // exactly the floor.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun a_window_exactly_at_the_floor_is_accepted(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 0);
+        assert!(escrow::claim_window(f.escrow_addr) == escrow::minimum_claim_window(), 0);
+    }
+
+    // The floor and the default are separate numbers with separate jobs: a floor
+    // can only prevent a catastrophically short window, while the default is the
+    // figure to reach for absent a reason.
+    #[test]
+    fun the_floor_is_thirty_days_and_below_the_default() {
+        assert!(escrow::minimum_claim_window() == 30 * 24 * 60 * 60, 0);
+        assert!(escrow::minimum_claim_window() < escrow::recommended_claim_window(), 1);
     }
 
     // The leaf must be deterministic across runs and machines, or a root built

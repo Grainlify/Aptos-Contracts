@@ -79,6 +79,27 @@ module grainlify_payout::escrow {
     /// tidy.
     const RECOMMENDED_CLAIM_WINDOW: u64 = 63072000;
 
+    /// The shortest claim window this contract will accept: 30 days in seconds.
+    ///
+    /// Distinct from `RECOMMENDED_CLAIM_WINDOW`, which is a default nobody is
+    /// forced to take. This is a floor, and it exists for one specific mistake.
+    ///
+    /// **A units slip.** `initialise(.., 30)` meaning thirty *days* is a plausible
+    /// call to write and there is nothing else in the system that would catch it.
+    /// It would publish a root whose claim window expired thirty seconds later,
+    /// making `sweep_unclaimed` available immediately and quietly defeating the
+    /// entire design - no cliff to see, no deadline anybody could have read in
+    /// time, and a sweep that looks perfectly legitimate on chain.
+    ///
+    /// The asymmetry decides where to put it: a floor can only ever prevent a
+    /// catastrophically short window, never a legitimate long one. So it costs
+    /// nothing real and forecloses the one error that turns this contract into a
+    /// way of not paying people.
+    ///
+    /// 30 days is low enough never to obstruct a genuine choice and high enough
+    /// that a seconds-for-days slip aborts rather than ships.
+    const MINIMUM_CLAIM_WINDOW: u64 = 2592000;
+
     // -----------------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------------
@@ -96,9 +117,9 @@ module grainlify_payout::escrow {
     /// Funding after publication could only create a surplus the published root
     /// does not account for, so it is refused rather than silently accepted.
     const E_ALREADY_SETTLED: u64 = 11;
-    /// A zero claim window would make every claim late the instant a root is
-    /// published.
-    const E_INVALID_WINDOW: u64 = 12;
+    /// The claim window is below `MINIMUM_CLAIM_WINDOW`. Catches a units slip -
+    /// seconds passed where days were meant - which nothing else would.
+    const E_WINDOW_TOO_SHORT: u64 = 12;
     /// The deadline may only ever move later. See `extend_deadline`.
     const E_DEADLINE_NOT_LATER: u64 = 13;
     /// Claims are still open, so unclaimed funds are not sweepable yet.
@@ -294,10 +315,12 @@ module grainlify_payout::escrow {
             !exists<Escrow>(escrow_address(admin_addr, event_id)),
             E_ALREADY_INITIALISED,
         );
-        // A zero window would make every claim late the instant a root is
-        // published, which is the one configuration that turns this contract
-        // into a way of not paying people.
-        assert!(claim_window > 0, E_INVALID_WINDOW);
+        // Below the floor is refused rather than clamped. A window of 30 seconds
+        // where 30 days was meant would publish a root that becomes sweepable
+        // almost immediately - no cliff anybody could see, and a sweep that looks
+        // entirely legitimate on chain. Aborting is the only outcome that makes
+        // the mistake visible at the moment it is made.
+        assert!(claim_window >= MINIMUM_CLAIM_WINDOW, E_WINDOW_TOO_SHORT);
 
         let ctor = object::create_named_object(admin, event_seed(event_id));
         let obj_signer = object::generate_signer(&ctor);
@@ -732,6 +755,13 @@ module grainlify_payout::escrow {
     /// transcribing a number of seconds.
     public fun recommended_claim_window(): u64 {
         RECOMMENDED_CLAIM_WINDOW
+    }
+
+    #[view]
+    /// The shortest window `initialise` will accept. A floor, not a default -
+    /// see `MINIMUM_CLAIM_WINDOW` for why the two are separate.
+    public fun minimum_claim_window(): u64 {
+        MINIMUM_CLAIM_WINDOW
     }
 
     #[view]

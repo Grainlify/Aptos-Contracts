@@ -507,7 +507,18 @@ module grainlify_payout::escrow {
     /// The contributor submits this themselves and pays their own gas, so their
     /// address reaches the chain only by their own action. The leaf commits to a
     /// salted hash of their identity beside the address, never the identity
-    /// itself, so the chain never carries a github-login-to-address mapping.
+    /// itself.
+    ///
+    /// **Do not overstate what that buys.** It means the chain carries no
+    /// directly readable github-login-to-address mapping, and that without the
+    /// salt nobody can compute one in bulk from the public list of logins. It
+    /// does *not* make an individual claim unlinkable: a claim shows an address
+    /// receiving an exact amount at an exact time, and the amounts come from a
+    /// deterministic function of public merged pull requests, so a distinctive
+    /// amount identifies its recipient without the leaf ever being reversed.
+    ///
+    /// The accurate claim is that this raises the cost of bulk correlation. Any
+    /// stronger wording, anywhere it might be read by a contributor, is false.
     ///
     /// Ordering is the security property: verify the proof, check the claimed
     /// marker, **set** the claimed marker, then transfer. Setting before the

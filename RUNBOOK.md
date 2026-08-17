@@ -67,8 +67,28 @@ missing.
    added — the root is write-once. Get the list of eligible-but-address-less
    contributors and look at it.
 3. **The salt exists and is stored.** Leaves commit to
-   `sha256(github_login || salt)`. If it is lost, no proof can ever be
-   regenerated and nobody can claim.
+   `sha256(github_login || salt)`.
+
+   Two things to understand about holding it, stated plainly because neither is
+   obvious from the code:
+
+   - **Keeping it means we retain the ability to link any leaf back to a GitHub
+     login.** That is a capability, not only a secret — it is what lets us answer
+     "was this leaf really mine?" for a contributor who asks, and it is what a
+     future leak would hand to somebody else.
+   - **Destroying it is what makes that link unrecoverable, by anyone including
+     us.** Once the claim leaves are stored, proofs no longer need the salt, so
+     destruction costs nothing operationally and forecloses the question
+     permanently in both directions.
+
+   The decision is per event and belongs after a successful settlement, not
+   before one. For the first event the salt is **kept**: it is a rehearsal, and
+   retaining the ability to recompute is worth more than the marginal privacy of
+   an event that has already been published.
+
+   Losing it is not symmetric with leaking it. Before publication, regenerate and
+   carry on. After publication, loss is survivable **only because the leaves are
+   stored** — proofs still work, and what is gone is the link back to logins.
 4. **The sweep destination address exists and you control it.** It is fixed at
    `initialise` and there is no path to change it. If it is wrong, the sweep is
    permanently unusable.

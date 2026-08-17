@@ -148,6 +148,46 @@ nobody reads is precisely how the missed-claim case happens.
 Anyone can verify the date themselves against the chain via `claim_deadline()`,
 which is a view for exactly that reason.
 
+### Copy for a failed verification — the exchange-address case
+
+The most likely verification failure, and one the signature requirement *creates*:
+it did not exist before we asked for proof of control.
+
+Somebody with no wallet who goes looking often already has an account at an
+exchange, and that account has a deposit address. Pasting it is the reasonable
+move for a person who has never held a key. It saves fine, normalises fine, and
+fails verification — because the exchange holds the key, not them.
+
+**Wrong:**
+
+> Invalid signature. Please try again.
+
+Reads as a bug in our software. They will report it, or give up, and either way we
+have lost somebody at the last step for doing the sensible thing.
+
+**Right:**
+
+> That address belongs to a service that holds the key for you — an exchange or a
+> custodial app. We can't pay out to one, because receiving a reward here means
+> proving you control the address, and only whoever holds the key can do that.
+>
+> You'll need an address you control yourself. That takes about five minutes to
+> set up, and your reward stays exactly where it is in the meantime.
+
+Three things it has to do:
+
+1. **Explain what happened in terms of the world, not our software.** "The service
+   holds the key" is a fact about their account; "invalid signature" is a fact
+   about our validator.
+2. **Say why it matters**, briefly. Proving control is the whole point of the step.
+3. **Not imply they did something foolish.** Pasting a deposit address is what a
+   reasonable person does. The copy should read as "here is how this works", never
+   as "you used the wrong kind of address".
+
+And, as everywhere else in this flow: **their reward is not at risk while they sort
+it out.** Say it in the error, not only on the happy path — this is the moment
+somebody is most likely to think they have lost something.
+
 ### No claim-rate floor
 
 A rule refusing to sweep below some claimed fraction was considered and rejected.

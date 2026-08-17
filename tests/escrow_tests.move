@@ -455,6 +455,65 @@ module grainlify_payout::escrow_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Fee sponsorship
+    // -----------------------------------------------------------------------
+
+    // A sponsor pays the gas; a sponsor gains nothing else.
+    //
+    // WHAT THIS TEST CAN AND CANNOT PROVE, because the distinction matters.
+    //
+    // Sponsored transactions (AIP-39) are a TRANSACTION-level construct. The fee
+    // payer appears in the transaction authenticator, and Aptos documents that
+    // it is charged "while not giving access to its signer for any other
+    // purposes". A Move unit test cannot construct a fee-payer transaction, so it
+    // cannot exercise that guarantee directly - that half must be verified on
+    // testnet, by sponsoring a real claim and confirming the sponsor's balance
+    // moves only by the fee.
+    //
+    // What this test proves is the half that lives in this module, and it is the
+    // half that would make sponsorship dangerous if it were wrong: claim() takes
+    // exactly ONE signer, and the destination is derived from it and nothing
+    // else. There is no parameter, no second signer, and no stored address that
+    // could redirect a payment. So however many accounts sign the surrounding
+    // transaction, the funds have exactly one reachable destination - the address
+    // committed in the leaf.
+    #[test(aptos_framework = @aptos_framework, admin = @0xA11CE)]
+    fun a_claim_can_only_ever_pay_the_address_in_the_leaf(
+        aptos_framework: &signer, admin: &signer,
+    ) {
+        let f = setup(aptos_framework, admin, 300_000);
+
+        let a = account_at(@0xAAA1);
+        let b = account_at(@0xBBB2);
+        // Stands in for a fee payer: an account that participates in the
+        // transaction and must gain nothing from the claim.
+        let sponsor = account_at(@0x5900);
+        let id_a = id(0x0A);
+        let id_b = id(0x0B);
+
+        let leaf_a = escrow::leaf_for(signer::address_of(&a), id_a, 100_000);
+        let leaf_b = escrow::leaf_for(signer::address_of(&b), id_b, 200_000);
+        let root = escrow::hash_node_for_test(leaf_a, leaf_b);
+        escrow::publish_root(admin, f.escrow_addr, root, 300_000);
+
+        let proof = vector::empty<vector<u8>>();
+        vector::push_back(&mut proof, leaf_b);
+        escrow::claim(&a, f.escrow_addr, id_a, 100_000, proof);
+
+        // The leaf's address, and only the leaf's address.
+        assert!(test_asset::balance_of(signer::address_of(&a), f.metadata) == 100_000, 0);
+
+        // Nobody else gained anything: not the other claimant, not the sponsor,
+        // not the admin, not the sweep destination.
+        assert!(test_asset::balance_of(signer::address_of(&b), f.metadata) == 0, 1);
+        assert!(test_asset::balance_of(signer::address_of(&sponsor), f.metadata) == 0, 2);
+        assert!(test_asset::balance_of(SWEEP_DEST, f.metadata) == 0, 3);
+
+        // And the escrow lost exactly what the leaf committed to.
+        assert!(escrow::balance(f.escrow_addr) == 200_000, 4);
+    }
+
+    // -----------------------------------------------------------------------
     // What a claim must NOT touch
     // -----------------------------------------------------------------------
 

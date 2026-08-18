@@ -40,7 +40,7 @@ output, including errors, not an interpretation of them.</p>
   <legend>Escrow under test</legend>
   <div class="row">
     <div><label>Module address</label><input id="module" value="0x1b419fe2b8c2a694eda8398af4bb6f6980915f9e3ed856b3b0fb4f26597f22c9"></div>
-    <div><label>Event id (utf8)</label><input id="event" value="wallet-check"></div>
+    <div><label>Event id (utf8)</label><input id="event" value="wallet-check-petra"></div>
   </div>
   <div class="row">
     <div><label>Identity hash (32 bytes hex)</label><input id="ident" value="0x2222222222222222222222222222222222222222222222222222222222222222"></div>
@@ -168,6 +168,37 @@ const err = (e) => ({
 });
 
 let WALLETS = [], W = null, ACCOUNT = null, PATH = null, CHOSEN = null;
+
+// Decode-and-validate, used by EVERY caller.
+//
+// The first version let derive() pass the raw string "0x2222..." straight into a
+// view call. The SDK serialised it as a Move string, so the module received the
+// ASCII bytes 0x30 0x78 0x32 0x32 - "0", "x", "2", "2" - and aborted with
+// E_BAD_DIGEST_LENGTH. Step 2 decoded it properly; derive did not. The defect was
+// the inconsistency, so there is now one function and no other way to read the
+// field.
+//
+// Validating here also means a malformed value is refused in the page, with a
+// message naming the problem, rather than becoming a Move abort and a wasted
+// round trip to the chain.
+function identBytes() {
+  const raw = $("ident").value.trim();
+  const hex = raw.replace(/^0x/i, "");
+  if (!/^[0-9a-fA-F]*$/.test(hex)) throw new Error(
+    `identity hash contains non-hex characters: ${JSON.stringify(raw)}`);
+  if (hex.length !== 64) throw new Error(
+    `identity hash must be exactly 32 bytes (64 hex characters); got ${hex.length} ` +
+    `character${hex.length === 1 ? "" : "s"} from ${JSON.stringify(raw)}`);
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+function amountArg() {
+  const v = $("amount").value.trim();
+  if (!/^\d+$/.test(v) || Number(v) <= 0) throw new Error(
+    `amount must be a positive whole number of USDC minor units; got ${JSON.stringify(v)}`);
+  return Number(v);
+}
 let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null;
 
 // --- 0. discovery ----------------------------------------------------------
@@ -230,9 +261,10 @@ $("derive").onclick = async () => {
 
     const [escrow] = await aptos.view({ payload: {
       function: `${mod}::escrow::escrow_address`, functionArguments: [mod, eventHex] }});
+    // Bytes, not the hex string. See identBytes().
     const [leaf] = await aptos.view({ payload: {
       function: `${mod}::escrow::leaf_for`,
-      functionArguments: [addr, $("ident").value.trim(), $("amount").value.trim()] }});
+      functionArguments: [addr, identBytes(), amountArg()] }});
     ESCROW = escrow; LEAF = leaf;
 
     let onChainRoot = null, claimed = null, bal = null;
@@ -240,9 +272,23 @@ $("derive").onclick = async () => {
     try { [claimed] = await aptos.view({ payload: { function: `${mod}::escrow::is_claimed`, functionArguments: [escrow, leaf] }}); } catch (e) { claimed = err(e); }
     try { [bal] = await aptos.view({ payload: { function: `${mod}::escrow::balance`, functionArguments: [escrow] }}); } catch (e) { bal = err(e); }
 
-    show($("outE"), { escrow, leaf, claimantAddress: addr, onChainRoot, alreadyClaimed: claimed, escrowBalance: bal,
-      note: "root must equal leaf for a single-leaf tree, and alreadyClaimed must be false" }, true);
-    $("step2").disabled = false;
+    const rootMatches = onChainRoot && String(onChainRoot.vec ? onChainRoot.vec[0] : onChainRoot) === String(leaf);
+    const problems = [];
+    if (claimed === true) problems.push(
+      "ALREADY CLAIMED — this leaf has been claimed on chain, so step 3 will abort " +
+      "with E_ALREADY_CLAIMED. A claimed leaf cannot be reclaimed. Use a FRESH event id: " +
+      "./setup-escrow.sh <your-address> wallet-check-<something-new>");
+    if (onChainRoot && !rootMatches) problems.push(
+      "ROOT MISMATCH — the published root is not this leaf, so the proof will not verify. " +
+      "Either the escrow was published for a different address, or the amount or identity " +
+      "hash differs from the one setup-escrow.sh used.");
+    if (!onChainRoot || (onChainRoot.vec && onChainRoot.vec.length === 0)) problems.push(
+      "NO ROOT PUBLISHED — run setup-escrow.sh for this event id first.");
+
+    show($("outE"), { escrow, leaf, claimantAddress: addr, onChainRoot, alreadyClaimed: claimed,
+      escrowBalance: bal, rootMatchesLeaf: rootMatches,
+      READY: problems.length === 0, problems }, problems.length === 0);
+    $("step2").disabled = problems.length !== 0;
   } catch (e) { show($("outE"), err(e), false); }
 };
 
@@ -282,8 +328,7 @@ $("step2").onclick = async () => {
       options: { maxGasAmount: 20000 },
       data: {
         function: `${mod}::escrow::claim`,
-        functionArguments: [ESCROW, Hex.fromHexString($("ident").value.trim()).toUint8Array(),
-                            Number($("amount").value.trim()), new MoveVector([])],
+        functionArguments: [ESCROW, identBytes(), amountArg(), new MoveVector([])],
       },
     });
 

@@ -347,6 +347,27 @@ It also happens to be the shape wallet support varies on, so it doubles as the
 wallet compatibility check — swap the local key for a wallet signer and leave the
 rest alone.
 
+### Verified from a real wallet
+
+`tools/wallet-check` is the browser version of that check, and **Petra passes it
+end to end**:
+
+| | |
+|---|---|
+| Claim (Petra, sponsored) | [`0xe33e61b8…802b83`](https://explorer.aptoslabs.com/txn/0xe33e61b8b63a49f4fee77f21459a69b039cecd22efa423f3f60dc732d2802b83?network=testnet) |
+| Sender | `0xb33bd154…ac4022`, **`sequence_number: 0`** |
+| Authenticator | `fee_payer_signature`, fee payer `0x1b41…22c9` |
+| Gas | 14,920 units × 100 octas, paid by the sponsor |
+
+`sequence_number: 0` is the detail worth keeping. That was the **first
+transaction the account had ever sent** — no account on chain before it, no APT,
+no USDC store. It received the full amount and paid nothing. The onboarding case
+is not being approximated here; it is the case that ran.
+
+Which wallets have been verified, and what the claim page may say for each, is in
+**[docs/WALLET-SUPPORT.md](docs/WALLET-SUPPORT.md)**. Copy may not name a wallet
+that table has not verified.
+
 ## Building and testing
 
 Requires the Aptos CLI.

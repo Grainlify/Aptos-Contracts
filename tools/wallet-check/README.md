@@ -93,7 +93,7 @@ onboarding story depends on.
 | --- | --- |
 | `aptos:signTransaction({transaction})` | `TypeError: Cannot read properties of undefined (reading 'bcsToHex')` — **inside Petra's own inpage.js**, not our code |
 | `aptos:signTransaction({rawTransaction, feePayerAddress})` with a **hex string** | `TypeError: this.fee_payer_address.serialize is not a function` — inside Petra |
-| `aptos:signTransaction({rawTransaction, feePayerAddress})` with an **`AccountAddress`** | see below |
+| `aptos:signTransaction({rawTransaction, feePayerAddress})` with an **`AccountAddress`** | **works** — this is the shape to use |
 | `aptos:signTransaction({rawTransaction})` | signs, but over the **plain** message — verification catches it |
 
 **The string error is not a missing capability.** Petra stored the value and later
@@ -121,6 +121,19 @@ That failure reads as a wallet bug and is not one. The page now sets the fee pay
 before signing, and **verifies the returned signature locally against the expected
 message before submitting** — so a wallet that signs the wrong payload is reported
 here, precisely, instead of becoming a chain error.
+
+### The shape that works
+
+```js
+await wallet.features["aptos:signTransaction"].signTransaction({
+  rawTransaction:  txn.rawTransaction,          // the inner RawTransaction
+  feePayerAddress: AccountAddress.from(SPONSOR) // the instance, never the hex string
+})
+```
+
+Set `txn.feePayerAddress` before signing as well, so the message the wallet is
+asked to sign is the fee-payer message and not the plain one. The page verifies
+the returned signature against that exact message locally before it submits.
 
 ## If a wallet fails step 2
 
@@ -152,17 +165,31 @@ four-second watchdog: the module sets a flag when it finishes, and if that never
 happens the panel says so. If you see that panel, stop — nothing below it is
 meaningful.
 
-## Caveat
+## Preparing an escrow before the wallet has connected
 
-**This page has not been run against a real wallet.** No browser here. What has
-been verified is narrower and worth stating exactly:
+The leaf commits to the claiming address, so a root cannot be published until the
+wallet is connected. `--prepare` does the half that does not need an address:
 
-- the pinned bundle URL returns 200 and is 1,029,031 bytes
-- its single sub-import (`/node/process.mjs`) returns 200
-- it has **zero range dependencies** — which is what broke the first version
-- all six names the page imports are present in its export list
-- the deployed module answers view calls (`recommended_claim_window` → 63072000)
+```sh
+./setup-escrow.sh --prepare wallet-check-connect     # initialise + fund
+./setup-escrow.sh 0x<addr> wallet-check-connect      # publish, once connected
+```
 
-None of that exercises a wallet. Treat a failure in the page's plumbing as at
-least as likely as one in the wallet — which is why every step prints what it
-attempted alongside what came back.
+Both modes are **safe to re-run.** Funding tops up to the target rather than
+adding to it, because funding twice makes `funded_total` exceed the root and
+`publish_root` then aborts with `E_ROOT_TOTAL_NOT_FUNDED` — a failure whose real
+cause is two invocations, and which reads like a broken escrow. If a root already
+exists the script prints it next to the leaf and stops rather than trying to
+correct a write-once value.
+
+## Where the plumbing was verified separately
+
+The page's own dependencies were checked before any wallet was involved, and it
+is worth keeping the distinction: the pinned bundle returns 200 at 1,029,031
+bytes, its single sub-import resolves, it has **zero range dependencies** (the
+thing that broke the first version), all six imported names are in its export
+list, and the deployed module answers view calls.
+
+None of that exercises a wallet — which is why every step prints what it
+attempted alongside what came back. A failure in this page's plumbing is at least
+as likely as one in the wallet.

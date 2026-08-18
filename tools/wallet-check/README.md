@@ -92,7 +92,20 @@ onboarding story depends on.
 | Shape | Result |
 | --- | --- |
 | `aptos:signTransaction({transaction})` | `TypeError: Cannot read properties of undefined (reading 'bcsToHex')` — **inside Petra's own inpage.js**, not our code |
-| `aptos:signTransaction({rawTransaction})` | signs |
+| `aptos:signTransaction({rawTransaction, feePayerAddress})` with a **hex string** | `TypeError: this.fee_payer_address.serialize is not a function` — inside Petra |
+| `aptos:signTransaction({rawTransaction, feePayerAddress})` with an **`AccountAddress`** | see below |
+| `aptos:signTransaction({rawTransaction})` | signs, but over the **plain** message — verification catches it |
+
+**The string error is not a missing capability.** Petra stored the value and later
+called `.serialize()` on it, which means it reached the point of serialising the
+fee payer — the support is there and the argument was the wrong *type*. It wants
+an `AccountAddress` instance, not hex.
+
+That was the fourth instance of one defect in this tool: a string handed to
+something expecting a typed value. The first three were `vector<u8>` fields; this
+one crosses into the extension. "Every `vector<u8>` from a helper" was too narrow
+a rule — the general one is that a value crossing a typed boundary must be
+constructed, never spelled.
 
 So the call shape matters, which is why the page tries several and prints every
 attempt. The first failing inside the wallet is a quirk to record, not something

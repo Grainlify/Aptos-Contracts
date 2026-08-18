@@ -219,7 +219,7 @@ function amountArg() {
     `amount must be a positive whole number of USDC minor units; got ${JSON.stringify(v)}`);
   return Number(v);
 }
-let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null, SPONSOR = null, EXPECTED_MSG = null;
+let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null, SPONSOR = null, SPONSOR_ADDR = null, EXPECTED_MSG = null;
 
 // --- 0. discovery ----------------------------------------------------------
 $("detect").onclick = () => {
@@ -391,7 +391,8 @@ $("step2").onclick = async () => {
     // with INVALID_SIGNATURE. That is exactly what happened, and the well-formed
     // authenticator is what makes it look like a wallet problem.
     const info = await (await fetch("/sponsor-info")).json();
-    SPONSOR = info.sponsor;
+    SPONSOR = info.sponsor;                       // hex string, for display only
+    SPONSOR_ADDR = AccountAddress.from(SPONSOR);  // the typed value wallets need
 
     TXN = await aptos.transaction.build.simple({
       sender: addr,
@@ -404,7 +405,7 @@ $("step2").onclick = async () => {
     });
     // Set it before signing so the sender and the fee payer sign over the same
     // message. serve.js signs as this same account.
-    TXN.feePayerAddress = AccountAddress.from(SPONSOR);
+    TXN.feePayerAddress = SPONSOR_ADDR;
     EXPECTED_MSG = generateSigningMessageForTransaction(TXN);
 
     // Wallets disagree about this call's shape. Try each and report which worked -
@@ -414,7 +415,23 @@ $("step2").onclick = async () => {
     // the correct message.
     const tries = PATH === "AIP-62"
       ? [["aptos:signTransaction({transaction})", () => W.features["aptos:signTransaction"].signTransaction({ transaction: TXN })],
-         ["aptos:signTransaction({rawTransaction, feePayerAddress})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction, feePayerAddress: SPONSOR })],
+         // AccountAddress, not a hex string.
+         //
+         // The string form produced, inside Petra:
+         //   TypeError: this.fee_payer_address.serialize is not a function
+         // Petra stored what it was given and later called .serialize on it. A
+         // string has none. That error is not a missing capability - it is Petra
+         // reaching the point of serialising the fee payer, which means the
+         // support is there and the argument was the wrong TYPE.
+         //
+         // Fourth instance of one defect in this file: a string handed to
+         // something that wanted a typed value. The first three were vector<u8>
+         // fields; this one crosses into the extension.
+         ["aptos:signTransaction({rawTransaction, feePayerAddress:AccountAddress})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction, feePayerAddress: SPONSOR_ADDR })],
+         ["aptos:signTransaction({transaction, asFeePayer:false})", () => W.features["aptos:signTransaction"].signTransaction({ transaction: TXN, asFeePayer: false })],
+         // Kept last and labelled: this is the shape that just failed, retained
+         // so the output shows the string/object difference rather than asserting it.
+         ["aptos:signTransaction({rawTransaction, feePayerAddress:string}) — expected to fail", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction, feePayerAddress: SPONSOR })],
          ["aptos:signTransaction({rawTransaction})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction })]]
       : [["window.aptos.signTransaction(txn)", () => window.aptos.signTransaction(TXN)],
          ["window.aptos.signTransaction({transaction})", () => window.aptos.signTransaction({ transaction: TXN })]];

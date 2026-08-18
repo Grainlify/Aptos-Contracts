@@ -1,181 +1,212 @@
-# Wallet support, and the copy that depends on it
+# Wallet support, and the claim flow that follows from it
 
-Sponsorship is what lets somebody who has never held a token receive one without
-first acquiring the token that pays for receiving it. It is the whole no-wallet
-onboarding story. It also is not universal — it depends on the wallet doing one
-specific thing, and wallets differ.
-
-This file records which wallets do it, how we found out, and what the claim page
-is allowed to say in each case.
-
-## Exactly one capability varies
-
-A sponsored claim is an AIP-39 fee-payer transaction. The contributor signs as
-**sender**; we sign as **fee payer** and submit. The contract is not involved in
-any of this — `claim` is an ordinary entry function and cannot tell who paid.
-
-So there is one question per wallet, and it is not "does it support
-sponsorship":
-
-> Will it sign, **as sender**, a transaction whose fee payer is somebody else?
-
-Three things follow that are easy to get wrong:
-
-- **Signing is not the test. Signing the right message is.** A fee-payer
-  transaction has its own signing message — different structure, different length
-  (measured: 257 bytes against 223). Hand a wallet the inner `RawTransaction` and
-  it will sign the *plain* message and return a perfectly well-formed
-  authenticator. The chain rejects it with `INVALID_SIGNATURE`, which reads as a
-  wallet bug and is not one.
-- **A wallet that signs as fee payer has told you nothing.** Different code path.
-- **Call shape is not capability.** Petra rejected two of four shapes with
-  internal `TypeError`s. It supports this fully. The argument was the wrong type.
-
-The check is `tools/wallet-check`. It verifies the returned signature against the
-expected fee-payer message locally, before submitting, so a wallet that signs the
-wrong payload is reported precisely instead of arriving later as a chain error.
+**Decision: the first payout is Petra only.** Petra is the one wallet verified end
+to end against the deployed module. Backpack could not be tested. Aptos Connect
+has not been tried. Rather than build capability detection and adaptive copy for
+wallets we cannot speak to, the flow instructs Petra and does not attempt others.
 
 ## The table
 
-Nothing goes in here that was not observed in a browser against the deployed
-module on testnet. "Not yet run" means not yet run — it is not a prediction, and
-copy may not treat it as one.
+Three verdicts. Nothing here is a prediction, and the two negatives are not the
+same kind of negative.
 
-| Wallet | Detect | Step 1 `signMessage` | Step 2 sign as sender | Step 3 lands on chain | Verified |
-|---|---|---|---|---|---|
-| **Petra** (AIP-62) | ✅ | ✅ derives to connected address | ✅ `{rawTransaction, feePayerAddress: AccountAddress}` | ✅ [`0xe33e61b8…802b83`](https://explorer.aptoslabs.com/txn/0xe33e61b8b63a49f4fee77f21459a69b039cecd22efa423f3f60dc732d2802b83?network=testnet) | 18 Aug 2026 |
-| **Aptos Connect** (Google) | — | — | — | — | not yet run |
-| **Backpack** | ✅ | ✅ | ⚠️ inconclusive — wallet was on **mainnet** | — | 18 Aug 2026, void |
-
-**Backpack's row is deliberately not a verdict.** It was connected to mainnet
-while the escrow is on testnet, so its refusal says nothing about whether it can
-sign as sender. Recording it as incapable would be a false negative that then
-propagated into copy — the same defect as recording an untested wallet as
-capable, in the other direction. It needs a re-run on testnet, and the escrow is
-ready for it: `wallet-check-backpack` is published, funded 100,000, and
-`is_claimed: false`.
-
-Two things came out of that run anyway, and both are now permanent:
-
-- **The page refuses to proceed on a network mismatch.** Connect compares the
-  wallet's reported chain against the fullnode's `chain_id` and disables every
-  step below if they differ. Petra reports it as the number `2`, Backpack as the
-  string `"aptos:mainnet"`; both are normalised. Without this, every downstream
-  failure looks like a wallet limitation.
-- **A refusal can no longer be reported as a signature.** Backpack answered
-  `{status:"Rejected"}` and the page printed `SIGNED: true`, because it read
-  `args` without reading `status`. There is now one gate that turns a wallet
-  response into a verified authenticator or a named failure, and nothing
-  downstream accepts anything else. See the tool's README.
-
-Escrows are provisioned and funded for the outstanding rows. Each is
-initialised with 100,000 USDC minor units (0.1 USDC) and a 30-day window; neither
-has a root, because **the leaf commits to the claiming address** and that address
-is not known until the wallet connects.
-
-| Event id | Escrow object | Root |
+| Wallet | Verdict | Basis |
 |---|---|---|
-| `wallet-check-connect` | `0xabf6ab4133004c4231aced2acff42cade54554367171bea081b8742e88c3c6d7` | pending an address |
-| `wallet-check-backpack` | `0x3bde1c88f2c524d7be14b6767411263e5aa10e2471b3fb933152ed2d96231135` | published, unclaimed — reusable |
+| **Petra** | **Verified end to end** | Sponsored claim landed on testnet: [`0xe33e61b8…802b83`](https://explorer.aptoslabs.com/txn/0xe33e61b8b63a49f4fee77f21459a69b039cecd22efa423f3f60dc732d2802b83?network=testnet). Sender `sequence_number: 0`, `fee_payer_signature`, full amount received, nothing paid. 18 Aug 2026. |
+| **Backpack** | **Untestable** | Connected on **mainnet** against a testnet escrow, so its refusal of `signTransaction` says nothing about capability. `signMessage` worked. 18 Aug 2026. |
+| **Aptos Connect** (Google) | **Untested** | Not attempted. |
 
-Connect the wallet, then publish:
+**Petra's working call shape**, which is the part a production client needs:
 
-```sh
-cd tools/wallet-check
-./setup-escrow.sh 0x<connected-address> wallet-check-connect
+```js
+await wallet.features["aptos:signTransaction"].signTransaction({
+  rawTransaction:  txn.rawTransaction,           // the inner RawTransaction
+  feePayerAddress: AccountAddress.from(SPONSOR), // the instance, never the hex string
+})
 ```
 
-### The Petra result is stronger than "it works"
+Set `txn.feePayerAddress` before signing, so the wallet is asked to sign the
+**fee-payer** message rather than the plain one — different structure, different
+length (257 bytes against 223). Hand Petra the bare `RawTransaction` and it signs
+the plain message, returns a well-formed authenticator, and the chain rejects it
+as `INVALID_SIGNATURE`.
 
-The claiming account's `sequence_number` was **0** — the claim was the first
-transaction that account had ever sent. It held no APT, had no account on chain
-until this transaction created one, and no USDC primary store until the claim
-created that too. It received 100,000 USDC units and paid nothing.
+Two of the four shapes tried failed inside Petra's own code, neither for lack of
+support: `{transaction}` threw on `bcsToHex`, and `feePayerAddress` as a hex
+string threw `this.fee_payer_address.serialize is not a function` — Petra had
+reached the point of serialising the fee payer, so the support was there and the
+argument was the wrong type.
 
-That is the exact case the product depends on, tested in the exact state a real
-first-time contributor is in. It is not a proxy for it.
+### Why Backpack is "untestable" and not "unsupported"
 
-## What the copy is allowed to say
+It was on mainnet. Every failure below that point looks exactly like a wallet
+limitation, which is why the check now refuses to proceed on a network mismatch.
+Recording it as incapable would be a false negative propagating into copy — the
+same defect as recording an untested wallet as capable, in the other direction.
 
-Three states, and the rule that keeps the fallback a fallback: **we attempt
-sponsorship by default and degrade only on evidence.** An unknown wallet gets the
-optimistic path and falls back at runtime if signing fails. It does not get
-pessimistic copy on the grounds that we have not tested it.
+Its escrow is ready for a re-run whenever we want one: `wallet-check-backpack`,
+published, funded 100,000, `is_claimed: false`. One quirk is worth keeping
+regardless of the verdict: Backpack returns a public key as
+`{"type":"Buffer","data":[...]}`, a Node `Buffer` through `JSON.stringify`, with
+none of the methods an SDK key object has.
 
-### State A — verified sponsor-capable
+## What the contributor actually sees, start to finish
 
-> **No fee.** We cover the network cost of sending this to you.
+The first payout runs on **Aptos testnet**, which is a locked decision for this
+workstream. That has one visible consequence — step 3 — and it is the largest
+piece of friction in the flow. Lines that change on mainnet are marked.
 
-Say it next to the connected wallet, after connect, not as a page-level promise.
-It is true of *that wallet*, which is what we verified.
+### 1. The notification
 
-### State B — verified not sponsor-capable
+> **You have a reward waiting — 12.50 USDC**
+>
+> For your merged contributions to `org/repo` between June and August.
+> Claim it by 12 March 2028.
 
-This is the one that needs care, because the obvious copy is wrong in a way that
-strands people.
+The date is in front of the person from the first contact, not only in the terms.
+The deadline wording rules are in the [README](../README.md#copy-for-the-terms-and-the-claim-page--the-obvious-wording-is-false) —
+in short, the date is when we *may* return unclaimed funds, not when the claim
+stops working, and missing it is recoverable by asking.
 
-**Wrong:**
+### 2. The claim page, before anything is connected
 
-> Your wallet doesn't support gasless claims. A small network fee (~0.015 APT)
-> applies.
+> **12.50 USDC is yours to claim**
+>
+> To receive it you'll need an Aptos wallet — an app that holds the reward for
+> you and that only you can open.
+>
+> We've tested this end to end with **Petra**, so that's the one we can walk you
+> through. Setting it up takes about three minutes.
+>
+> `[ Set up Petra ]`  ·  `[ I already have Petra ]`
 
-Two failures. It names our internal category — "gasless claims" is not a thing the
-reader has heard of — and, much worse, it quietly assumes they have APT. **A
-first-time contributor has none.** For them this is not a small fee, it is a
-closed door: they cannot claim without first acquiring the token, which is the
-problem sponsorship exists to remove. Presenting the dead end as a minor cost is
-the failure mode to avoid.
+Nothing about fees appears here, or anywhere. On the Petra path nobody pays
+anything, so there is no fee to disclose and no fallback to explain.
 
-**Right:**
+Note the framing: **"we've tested this end to end with Petra"**, not "Petra is
+required". That is what is true, and it ages correctly — when Aptos Connect is
+verified we add a button, and no sentence on this page becomes a lie.
 
-> Claiming from this wallet needs a small amount of APT — about 0.015 — to pay
-> the network. If you don't have any, connect with **Petra** instead and we'll
-> cover it. Your reward stays where it is either way.
+### 3. Setting up Petra — and the network step
 
-Three things it has to do:
+> **1. Install Petra** — [petra.app](https://petra.app), Chrome or Brave.
+> **2. Create a wallet.** Write the recovery phrase down on paper. Nobody at
+> Grainlify can see it, and nobody can recover it for you.
+> **3. Switch Petra to Testnet.** Settings → Network → Testnet.
+>
+> That third step matters: this payout runs on Aptos **testnet**, and Petra
+> starts on mainnet. If you skip it, the claim button won't work and it won't be
+> obvious why.
 
-1. **Lead with the remedy, not the obstacle.** The remedy is another wallet, and
-   it costs them nothing.
-2. **Don't assume they hold APT.** "If you don't have any" is the branch that
-   matters, and it is the majority case for the people this product is for.
-3. **Say the reward is not at risk.** This is the moment somebody concludes they
-   have lost something. Same rule as the exchange-address copy in the README.
+**On mainnet, step 3 disappears entirely** and this screen becomes two steps. It
+is here because it is true now, and because a contributor who skips it hits a
+failure whose cause is invisible from the wallet's side.
 
-Only name wallets in the table's verified column. Recommending an untested wallet
-here would turn a fallback into a second dead end.
+### 4. Connect, and prove the address is yours
 
-### State C — unknown wallet
+> **Connect Petra**
+>
+> We'll ask Petra to sign a short message. That proves you control this address —
+> it doesn't move anything and it doesn't cost anything.
+>
+> `[ Connect Petra ]`
 
-Say nothing about fees before we know. Try sponsored; if step 2 fails at runtime,
-move to state B's copy with the failure in hand.
+After connect, and before the claim button is enabled, two runtime checks. Both
+fail closed.
 
-**Wrong** (before connecting):
+**If it isn't Petra:**
 
-> Most wallets can claim with no fee.
+> **This looks like a different wallet — {name}.**
+>
+> Petra is the only wallet we've verified this payout with end to end, so it's
+> the only one we'll ask you to claim with. Anything else might work, and we're
+> not going to find that out with your reward.
+>
+> Your reward stays exactly where it is. `[ Set up Petra ]`
 
-Hedged, unverifiable by the reader, and it makes a promise we may have to
-withdraw one screen later — which is worse than never having made it. Before
-connect, the page talks about the amount and the address requirement. Fees are a
-post-connect concern because they are a per-wallet fact.
+**If Petra is on the wrong network:**
 
-### Never, in any state
+> **Petra is on Mainnet, and this payout is on Testnet.**
+>
+> Switch it in Settings → Network → Testnet, then connect again. Nothing is lost
+> by switching back and forth.
 
-- **"Free."** The claim costs the recipient nothing; it is not free. Somebody paid
-  the gas, and on a page about money that distinction is worth keeping.
-- **"Gas", "sponsored transaction", "fee payer", "gasless."** Ours, not theirs.
-- **Any fee statement before connect.** It is not knowable yet.
+Both are blocks, not warnings. The alternative is discovering the failure at
+claim time with money involved, and a wallet error at that moment reads as our
+software losing somebody's reward.
+
+The wallet check must run **after** connect, not from the installed-wallet list:
+another extension can claim `window.aptos`, and one did during testing — a
+Bitcoin wallet threw `Cannot redefine property: StacksProvider` and took the
+global. Trusting the list rather than the responder is how you end up asking the
+wrong extension to sign.
+
+### 5. The claim
+
+> **Claim 12.50 USDC**
+>
+> Petra will ask you to approve this. We cover the network cost, so the full
+> 12.50 arrives.
+>
+> `[ Claim ]`
+
+"We cover the network cost" is the only fee sentence anywhere in the flow, and it
+is a statement about what we do rather than a promise about what wallets support.
+
+### 6. Done
+
+> **12.50 USDC is in your wallet.**
+>
+> [View the transaction] · It may take a moment to appear in Petra.
+
+The last line exists because a first-time recipient's token store is *created* by
+this transaction. Petra can take a moment to show an asset it has never held, and
+that gap is the most likely reason somebody reports the payout as missing when it
+has already arrived.
+
+## What we deliberately did not build
+
+**No capability detection across wallets.** One verified wallet needs no
+detection — it needs a check that it is that wallet. Detection exists to choose
+between options, and there is one option.
+
+**No fee-fallback copy.** Petra supports sponsorship, so nobody on the supported
+path pays anything, and copy for a case that cannot currently arise is copy that
+will be wrong by the time it can. It comes back with the second wallet, if that
+wallet needs it.
+
+**No adaptive copy.** Same reason. Three copy states for one verified wallet is
+machinery serving a table with one row in it.
+
+## The self-paid fallback is not code, and cannot be deleted
+
+Worth stating precisely, because "keep the fallback code" implies there is some to
+keep and there is not.
+
+`claim` is a plain `public entry fun`. The contract has no idea who pays for gas
+and no way to find out — sponsorship is entirely an AIP-39 transaction-layer
+concern, and the only `sponsor` in the module is the account that *funds* an
+escrow, which is a different thing. So a contributor paying their own gas is not
+a feature we maintain; it is the **absence of a restriction**, and the only way to
+lose it is to deliberately add one.
+
+It is also, incidentally, the better-tested path. A Move unit test cannot
+construct a fee-payer transaction, so **every one of the 16 tests that calls
+`claim` is a self-paid claim** — verified: the suite contains no fee-payer
+construct at all. Sponsorship is the path that needed a testnet observation,
+precisely because it is the one the test suite structurally cannot reach.
 
 ## Keeping this honest
 
-The table is the only authority for what copy may claim. If the claim page names a
-wallet the table has not verified, the copy is ahead of the evidence — that is the
-same defect as a docs claim the code does not support, and it should be treated
-the same way.
+The table is the only authority for what the flow may name. If the claim page
+names a wallet the table has not verified, the copy is ahead of the evidence —
+the same defect as a docs claim the code does not support, and to be treated the
+same way.
 
-Re-run the check when a wallet ships a major version. This is a wallet-behaviour
-record with a shelf life, not a property of our contract.
+Two rules the Backpack run earned:
 
-And a rule the Backpack run earned: **a failure only goes in the table once the
-setup is known good.** A wallet on the wrong network, or a page bug, produces
-findings shaped exactly like wallet limitations. "Inconclusive" is a legitimate
-cell value here; a guess is not.
+- **A failure only becomes a verdict once the setup is known good.** A wallet on
+  the wrong network produces findings shaped exactly like wallet limitations.
+  "Untestable" is a legitimate verdict; a guess is not.
+- **Re-run on a wallet's major version.** This is a record of wallet behaviour
+  with a shelf life, not a property of our contract.

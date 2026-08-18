@@ -164,6 +164,12 @@ which is a view for exactly that reason.
 
 ### Copy for a failed verification — the exchange-address case
 
+**Dormant in the first payout.** That flow is Petra-connect only, so the address
+comes from the wallet and there is no field to paste into — you cannot connect to
+an exchange, so this failure cannot arise. Keep the copy: it becomes live the
+moment we accept a typed address, and the reasoning below is why it exists.
+See [docs/WALLET-SUPPORT.md](docs/WALLET-SUPPORT.md).
+
 The most likely verification failure, and one the signature requirement *creates*:
 it did not exist before we asked for proof of control.
 
@@ -364,7 +370,9 @@ transaction the account had ever sent** — no account on chain before it, no AP
 no USDC store. It received the full amount and paid nothing. The onboarding case
 is not being approximated here; it is the case that ran.
 
-Which wallets have been verified, and what the claim page may say for each, is in
+**The first payout is Petra only** — the one wallet verified end to end. Which
+wallets have been tried, what the contributor sees start to finish, and why no
+fee copy appears anywhere in that flow is in
 **[docs/WALLET-SUPPORT.md](docs/WALLET-SUPPORT.md)**. Copy may not name a wallet
 that table has not verified.
 

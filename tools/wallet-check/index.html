@@ -32,6 +32,7 @@ output, including errors, not an interpretation of them.</p>
   <legend>0 · Wallet</legend>
   <button id="detect">Detect wallets</button>
   <button id="connect" class="sec">Connect</button>
+  <div id="picker" style="margin:.4rem 0"></div>
   <pre id="out0">Click "Detect wallets" first.</pre>
 </fieldset>
 
@@ -67,11 +68,71 @@ output, including errors, not an interpretation of them.</p>
   <pre id="out3">Run step 2 first.</pre>
 </fieldset>
 
+<script>
+// Runs before the module. If the module graph fails to load, an ES module cannot
+// report that from inside itself - which is exactly what happened: no output, no
+// error in the page, and the reason only visible in the console.
+(function () {
+  var panel = null;
+  function report(title, detail) {
+    if (!panel) {
+      panel = document.createElement("pre");
+      panel.className = "bad";
+      panel.style.margin = "1rem 0";
+      document.body.insertBefore(panel, document.body.firstChild.nextSibling);
+    }
+    panel.textContent = "PAGE FAILURE — " + title + "\n\n" + detail +
+      "\n\nThis is the page, not the wallet. Nothing below will work until it is fixed.";
+  }
+  window.addEventListener("error", function (e) {
+    report(e.message || "script error",
+      (e.filename || "") + (e.lineno ? ":" + e.lineno : "") + "\n" + (e.error && e.error.stack || ""));
+  }, true);
+  window.addEventListener("unhandledrejection", function (e) {
+    report("unhandled rejection", String(e.reason && e.reason.stack || e.reason));
+  });
+  // Watchdog: the module sets __READY at the end. If it never does, say so
+  // instead of leaving dead buttons.
+  setTimeout(function () {
+    if (!window.__READY) {
+      report("the module never finished loading",
+        "No import error was captured, but the script did not reach the end.\n" +
+        "Check the console for a module resolution failure.");
+    }
+  }, 4000);
+})();
+</script>
+
 <script type="module">
+// Exact version, and the STANDALONE bundle: every dependency is resolved at
+// build time inside one file.
+//
+// The previous version imported @aptos-labs/wallet-standard, which declares
+// ts-sdk@^7.1.0 - a RANGE. esm.sh resolved it to a build where AnyPublicKey had
+// moved, the module graph failed, and no handler ever bound. Pinning our own
+// import did not help, because the range belonged to the dependency.
+//
+// This build has zero range sub-imports (verified), and the discovery protocol
+// below replaces that package in about ten lines.
 import {
   Aptos, AptosConfig, Network, Hex, MoveVector, Serializer,
-} from "https://esm.sh/@aptos-labs/ts-sdk@7.3.0";
-import { getAptosWallets } from "https://esm.sh/@aptos-labs/wallet-standard@2.0.0";
+} from "https://esm.sh/@aptos-labs/ts-sdk@7.3.0/es2022/ts-sdk.bundle.mjs";
+
+// AIP-62 / wallet-standard discovery, by hand.
+//
+// The protocol is small: announce the app, and wallets hand themselves over -
+// those already loaded respond to the announcement, later ones announce
+// themselves and we hand them the same registry.
+function discoverWallets() {
+  const found = [];
+  const api = { version: "1.0.0", register: (...ws) => { found.push(...ws); return () => {}; } };
+  const onRegister = (e) => { try { e.detail(api); } catch (_) {} };
+  window.addEventListener("wallet-standard:register-wallet", onRegister);
+  window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api }));
+  window.removeEventListener("wallet-standard:register-wallet", onRegister);
+  // Aptos wallets expose aptos:* features; ignore wallets for other chains.
+  return found.filter((w) => Object.keys(w.features || {}).some((f) => f.startsWith("aptos:")));
+}
 
 const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
 const $ = (id) => document.getElementById(id);
@@ -94,25 +155,46 @@ const err = (e) => ({
   stack: e && e.stack,
 });
 
-let WALLETS = [], W = null, ACCOUNT = null, PATH = null;
+let WALLETS = [], W = null, ACCOUNT = null, PATH = null, CHOSEN = null;
 let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null;
 
 // --- 0. discovery ----------------------------------------------------------
 $("detect").onclick = () => {
-  const found = [];
+  const listed = [];
   try {
-    const { aptosWallets, on } = getAptosWallets();
-    WALLETS = aptosWallets || [];
-    for (const w of WALLETS) found.push({ standard: "AIP-62", name: w.name, version: w.version, features: Object.keys(w.features || {}) });
-  } catch (e) { found.push({ standard: "AIP-62", error: err(e) }); }
-  if (window.aptos) found.push({ standard: "legacy window.aptos", methods: Object.keys(window.aptos) });
-  show($("out0"), { detected: found.length, found }, found.length > 0);
+    WALLETS = discoverWallets();
+    WALLETS.forEach((w, i) =>
+      listed.push({ index: i, standard: "AIP-62", name: w.name, version: w.version,
+                    aptosFeatures: Object.keys(w.features || {}).filter((f) => f.startsWith("aptos:")) }));
+  } catch (e) { listed.push({ standard: "AIP-62", error: err(e) }); }
+  if (window.aptos) listed.push({ index: "legacy", standard: "legacy window.aptos",
+                                  methods: Object.keys(window.aptos) });
+
+  // Several extensions may be installed and they fight over globals, so pick
+  // explicitly rather than taking whichever registered first.
+  const box = $("picker"); box.innerHTML = "";
+  WALLETS.forEach((w, i) => {
+    const b = document.createElement("button"); b.className = "sec";
+    b.textContent = "Use " + w.name;
+    b.onclick = () => { CHOSEN = i; show($("out0"), { chosen: w.name, index: i }, true); };
+    box.appendChild(b);
+  });
+  if (window.aptos) {
+    const b = document.createElement("button"); b.className = "sec";
+    b.textContent = "Use legacy window.aptos";
+    b.onclick = () => { CHOSEN = "legacy"; show($("out0"), { chosen: "legacy window.aptos" }, true); };
+    box.appendChild(b);
+  }
+  show($("out0"), { detected: listed.length, listed,
+    next: listed.length ? "pick one above, then Connect" : "no Aptos wallet registered" },
+    listed.length > 0);
 };
 
 $("connect").onclick = async () => {
   try {
-    if (WALLETS.length) {
-      W = WALLETS[0]; PATH = "AIP-62";
+    if (CHOSEN === null && WALLETS.length) CHOSEN = 0;
+    if (CHOSEN !== "legacy" && WALLETS.length) {
+      W = WALLETS[CHOSEN]; PATH = "AIP-62";
       const res = await W.features["aptos:connect"].connect();
       ACCOUNT = res.args ?? res.account ?? res;
     } else if (window.aptos) {
@@ -229,4 +311,5 @@ $("step3").onclick = async () => {
     show($("out3"), await res.json(), true);
   } catch (e) { show($("out3"), err(e), false); }
 };
+window.__READY = true;
 </script>

@@ -73,9 +73,41 @@ That is not a dead end, it is the finding. It means that wallet needs the
 self-paid fallback: the contributor pays their own gas, and the copy has to say
 so rather than promising there is never a fee. Record it and move on.
 
+## Several wallet extensions installed?
+
+Detect lists everything that registers and gives you a button per wallet — pick
+one explicitly rather than letting the page take whichever registered first.
+
+If results look strange, **try a clean Chrome profile with only Petra.**
+Extensions genuinely fight over globals: a first run here produced
+`Cannot redefine property: StacksProvider` from an unrelated Bitcoin wallet, and
+`window.aptos` in particular can be claimed by something that is not the wallet
+you think. The AIP-62 path is per-wallet and does not have that problem, which is
+why the picker prefers it and legacy `window.aptos` is offered last.
+
+## If the page itself breaks
+
+A module-load failure used to be invisible: no output, no error in the page, dead
+buttons, and the reason only in the console. An ES module cannot report its own
+import failure from inside itself.
+
+There is now a plain script that runs first, catches `error` and
+`unhandledrejection`, and shows a **PAGE FAILURE** panel at the top. It also has a
+four-second watchdog: the module sets a flag when it finishes, and if that never
+happens the panel says so. If you see that panel, stop — nothing below it is
+meaningful.
+
 ## Caveat
 
-**This page has not been run against a real wallet.** It was written without a
-browser available, so treat a failure in the page's own plumbing as at least as
-likely as a failure in the wallet — which is why every step prints what it
+**This page has not been run against a real wallet.** No browser here. What has
+been verified is narrower and worth stating exactly:
+
+- the pinned bundle URL returns 200 and is 1,029,031 bytes
+- its single sub-import (`/node/process.mjs`) returns 200
+- it has **zero range dependencies** — which is what broke the first version
+- all six names the page imports are present in its export list
+- the deployed module answers view calls (`recommended_claim_window` → 63072000)
+
+None of that exercises a wallet. Treat a failure in the page's plumbing as at
+least as likely as one in the wallet — which is why every step prints what it
 attempted alongside what came back.

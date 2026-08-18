@@ -14,8 +14,15 @@ whether a failure is a wallet limitation or our bug.
 cd tools/wallet-check
 npm install                                  # once
 npm run build                                # once — bundles the SDK locally
+npm test                                     # the wallet boundary, offline
 node serve.js                                # http://localhost:8899
 ```
+
+`npm test` needs no wallet and no network. It runs the boundary described below
+against the **verbatim responses real wallets returned**, and
+`./mutate.sh` re-breaks the boundary eleven ways to show the tests are
+load-bearing (11 killed, 0 survived). The tests are sliced out of `index.html` by
+`extract-boundary.mjs`, so they pin the page rather than a copy of it.
 
 **Restarting?** `pkill -f "node serve.js"` first. A stale copy keeps the port and
 answers with whatever routes it had when it started, which looks exactly like a
@@ -85,6 +92,88 @@ result.
 receives USDC having paid no gas — which is the property the whole no-wallet
 onboarding story depends on.
 
+## The wallet boundary
+
+One function turns a wallet response into either a verified authenticator or a
+**named failure**, and nothing downstream accepts anything else. It exists
+because one defect appeared three times here, each time in a different slot: **a
+failure occupying the place a value belongs in.**
+
+1. A failed view call was compared to a leaf and printed `ROOT MISMATCH` — a
+   confident wrong answer that sent the reader hunting an address discrepancy
+   that did not exist.
+2. Backpack answered `signTransaction` with `{status:"Rejected"}`. The line
+   `const auth = r.args ?? r.authenticator ?? r` found no `args` and fell through
+   to `r`, handing **the refusal itself** downstream as the authenticator. The
+   page printed `SIGNED: true`.
+3. That object then reached submit as
+   `TypeError: SENDER_AUTH.serialize is not a function` — three steps from the
+   response that caused it.
+
+`?? r` was in this file **three times** — `connect`, `signMessage` and
+`signTransaction` — so this was one shape of bug, not one bug. AIP-62 replies
+with `UserResponse<T>`: `{status:"Approved", args:T}` or `{status:"Rejected"}`.
+Reading `args` without reading `status` treats a refusal as a payload.
+
+The rule, sibling to the typed-boundary rule already in this file:
+
+> **A wallet response is not a value until something has decided that it is.**
+
+Two consequences are the whole point:
+
+- **The authenticator that reaches step 3 is one we built** from bytes that have
+  just been verified. The wallet's own object is never forwarded, so it cannot
+  fail at submit. Which variant to build is not guessed — whichever of Ed25519 or
+  SingleKey derivation reproduces the connected address is the scheme that
+  account uses.
+- **Verification is not optional.** The old code had a third verdict, `null`,
+  meaning both "an authenticator I cannot check" and "not an authenticator at
+  all", and it accepted both with the note *"step 3 will tell you whether the
+  chain accepts it."* That is precisely what the local verifier was built to
+  replace. There is now no such path: an unverifiable response is a failure with
+  a name.
+
+One name per cause, never a name covering two — asserted by a test that fails if
+any two collide:
+
+| Failure | Means |
+|---|---|
+| `EMPTY_RESPONSE` | the call returned null/undefined |
+| `WALLET_REJECTED` | `status` was not "Approved" |
+| `APPROVED_BUT_EMPTY` | approved, no `args` |
+| `NOT_AN_AUTHENTICATOR` | neither key nor signature present |
+| `AUTHENTICATOR_HAS_NO_PUBLIC_KEY` / `..._NO_SIGNATURE` | one of the two absent |
+| `PUBLIC_KEY_UNREADABLE` / `SIGNATURE_UNREADABLE` | present but no bytes could be read |
+| `UNSUPPORTED_KEY_SCHEME` | not a 32-byte Ed25519 key |
+| `SIGNING_KEY_IS_NOT_THE_CONNECTED_ACCOUNT` | derives to neither address |
+| `SIGNATURE_OVER_WRONG_MESSAGE` | valid signature, wrong payload |
+| `VERIFY_THREW` / `AUTHENTICATOR_NOT_SERIALISABLE` | our bug, not the wallet's |
+
+**`WALLET_REJECTED` cannot say why.** `UserResponse` carries no reason on a
+refusal, so it does not distinguish a user declining from the wallet declining
+for its own reasons — wrong network, unsupported method, internal error. The
+page says so rather than implying the user clicked no.
+
+## The network check
+
+Backpack reported `"aptos:mainnet"` while the escrow is on testnet. Signing
+against the wrong chain is a whole class of confusing failure whose symptoms look
+like wallet limitations, and it is checkable at connect time, before anything is
+signed — so **connect now compares the wallet's chain against the fullnode's
+`chain_id` and disables every step below if they differ.**
+
+The two wallets report it differently, which is why both are normalised:
+
+| Wallet | Reported as |
+|---|---|
+| Petra | `chainId: 2` — a number |
+| Backpack | `"chainId": "aptos:mainnet"` — a CAIP-2-style string |
+
+Backpack **does** have testnets: Settings → Preferences → enable Developer Mode,
+then the network selector at the top of the wallet menu → Add Network. Its public
+docs describe that flow generically and do not name Aptos testnet, so whether
+Aptos testnet is offered there has to be confirmed in the extension.
+
 ## Wallet quirks found so far
 
 **Petra** (AIP-62), tested 18 Aug 2026:
@@ -134,6 +223,25 @@ await wallet.features["aptos:signTransaction"].signTransaction({
 Set `txn.feePayerAddress` before signing as well, so the message the wallet is
 asked to sign is the fee-payer message and not the plain one. The page verifies
 the returned signature against that exact message locally before it submits.
+
+**Backpack** (AIP-62), tested 18 Aug 2026, **on mainnet** — so step 2's result is
+not a capability finding:
+
+| What | Result |
+| --- | --- |
+| Reported network | `"aptos:mainnet"`, against a testnet escrow |
+| `aptos:signMessage` | passes |
+| Public key shape | `{"type":"Buffer","data":[...]}` — a Node `Buffer` through `JSON.stringify`, so it has no `authKey()` or `derivedAddress()` |
+| `aptos:signTransaction({transaction})` | `{status:"Rejected"}` |
+
+The `Buffer` shape is the counterpart to Petra's `bcsToHex`: both wallets hand
+back something the SDK's own types do not describe. Reading methods off it
+reported `<no derivedAddress()>` for a key that was perfectly good, so keys are
+now turned into **bytes** before anything is derived from them.
+
+Backpack has to be re-run on testnet before its step 2 means anything. The
+escrow is ready: `wallet-check-backpack` is published, funded 100,000 and
+`is_claimed: false`.
 
 ## If a wallet fails step 2
 

@@ -129,6 +129,8 @@ output, including errors, not an interpretation of them.</p>
 import {
   Aptos, AptosConfig, Network, Hex, MoveVector, Serializer,
   AccountAddress, generateSigningMessageForTransaction,
+  Ed25519PublicKey, Ed25519Signature, AnyPublicKey, AnySignature,
+  AccountAuthenticatorEd25519, AccountAuthenticatorSingleKey,
 } from "./vendor/ts-sdk.mjs";
 
 // AIP-62 / wallet-standard discovery, by hand.
@@ -221,6 +223,239 @@ function amountArg() {
 }
 let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null, SPONSOR = null, SPONSOR_ADDR = null, EXPECTED_MSG = null;
 
+// ===========================================================================
+// THE WALLET BOUNDARY
+//
+// One place where a wallet response becomes either a value or a NAMED failure.
+// Nothing downstream accepts anything else.
+//
+// This exists because of a defect that has now appeared three times in this
+// tool, each time in a different slot: a FAILURE OCCUPYING THE PLACE A VALUE
+// BELONGS IN.
+//
+//   1. A failed view call was compared to a leaf and reported as ROOT MISMATCH -
+//      a confident wrong answer sending the reader after an address discrepancy
+//      that did not exist. Fixed by tryView()'s {ok, value} shape.
+//   2. Backpack replied {status:"Rejected"} to signTransaction. The old line
+//        const auth = r.args ?? r.authenticator ?? r;
+//      found no `args`, fell through to `r`, and handed THE REFUSAL ITSELF
+//      downstream as the authenticator. The page printed SIGNED: true.
+//   3. That object then reached submit, where it produced
+//        TypeError: SENDER_AUTH.serialize is not a function
+//      three steps away from the response that caused it.
+//
+// The `?? r` fallback was in this file three times - connect, signMessage and
+// signTransaction - so this is not one bug but one shape of bug. The rule that
+// replaces it is the sibling of the typed-boundary rule already in this file:
+//
+//   A wallet response is not a value until something has decided that it is.
+//
+// Two consequences worth stating, because they are the whole point:
+//   - The authenticator that reaches step 3 is one WE BUILT from verified bytes.
+//     The wallet's own object is never forwarded, so it cannot fail at submit.
+//   - Verification is not optional. There is no "the chain will tell you" path;
+//     the local verifier was built to replace exactly that.
+// ===========================================================================
+
+// AIP-62 replies with UserResponse<T>:  {status:"Approved", args:T} | {status:"Rejected"}
+function unwrap(r, what) {
+  if (r == null)
+    return { ok: false, failure: "EMPTY_RESPONSE", detail: `${what} returned ${String(r)}` };
+  const status = r.status ?? r.result?.status;
+  if (typeof status === "string" && status.toLowerCase() !== "approved")
+    return { ok: false, failure: "WALLET_REJECTED", raw: r,
+      detail: `${what}: the wallet replied status "${status}". This is a REFUSAL, not a ` +
+        `result. AIP-62 carries no reason on a refusal, so it does not distinguish a user ` +
+        `declining from the wallet declining for its own reasons - wrong network, ` +
+        `unsupported method, or an internal error. Check the wallet's own UI and console.` };
+  const v = r.args ?? r.account ?? (status !== undefined ? undefined : r);
+  if (v === undefined)
+    return { ok: false, failure: "APPROVED_BUT_EMPTY", raw: r,
+      detail: `${what}: status "${status}" but no args to read` };
+  return { ok: true, value: v };
+}
+
+// Wallets hand back bytes in at least five shapes. Backpack's public key arrived
+// as {"type":"Buffer","data":[...]} - a Node Buffer that has been through
+// JSON.stringify, which has none of the methods an SDK key object has.
+function toBytes(v) {
+  if (v == null) return null;
+  if (v instanceof Uint8Array) return v;
+  if (Array.isArray(v)) return new Uint8Array(v);
+  if (typeof v === "string") { try { return Hex.fromHexString(v).toUint8Array(); } catch { return null; } }
+  if (typeof v !== "object") return null;
+  if (v.type === "Buffer" && Array.isArray(v.data)) return new Uint8Array(v.data);   // Backpack
+  if (typeof v.toUint8Array === "function") { try { return v.toUint8Array(); } catch {} }
+  if (typeof v.bcsToBytes === "function")   { try { return v.bcsToBytes();   } catch {} }
+  const ks = Object.keys(v);
+  if (ks.length && ks.every((k) => /^\d+$/.test(k)))                                  // {"0":1,"1":2,...}
+    return new Uint8Array(ks.sort((a, b) => a - b).map((k) => v[k]));
+  return null;
+}
+
+// Dig for the innermost byte array of an EXPECTED LENGTH.
+//
+// Wallets nest to different depths - a bare Ed25519PublicKey, an AnyPublicKey
+// wrapping one, or a JSON round-trip of either. Searching by expected length is
+// what makes descending safe: a 32-byte field cannot be mistaken for anything
+// else on the way down.
+function bytesOfLength(v, lengths, depth) {
+  depth = depth || 0;
+  if (v == null || depth > 4) return null;
+  const direct = toBytes(v);
+  if (direct && lengths.includes(direct.length)) return direct;
+  if (typeof v === "object")
+    for (const k of ["publicKey", "public_key", "key", "signature", "data", "value", "inner"])
+      if (k in v) { const got = bytesOfLength(v[k], lengths, depth + 1); if (got) return got; }
+  return null;
+}
+
+// Prove serialisation HERE, where the response is still in view.
+const serialised = (auth) => {
+  try { const s = new Serializer(); auth.serialize(s); return s.toUint8Array(); } catch { return null; }
+};
+const hexOf = (u8) => "0x" + [...u8].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+// The single gate. Returns {ok:true, auth, ...} or {ok:false, failure, detail}.
+// One failure name per cause; never a name that could cover two.
+function senderAuthenticator(response, what, expectedMsg, connectedAddress) {
+  const u = unwrap(response, what);
+  if (!u.ok) return u;
+  const raw = u.value;
+
+  const pkField  = raw?.public_key ?? raw?.publicKey;
+  const sigField = raw?.signature;
+  if (pkField == null && sigField == null)
+    return { ok: false, failure: "NOT_AN_AUTHENTICATOR", raw,
+      detail: `${what}: the response was approved but carries neither a public key nor a ` +
+        `signature, so there is nothing to submit.` };
+  if (pkField == null)
+    return { ok: false, failure: "AUTHENTICATOR_HAS_NO_PUBLIC_KEY", raw, detail: `${what}: signature present, public key absent.` };
+  if (sigField == null)
+    return { ok: false, failure: "AUTHENTICATOR_HAS_NO_SIGNATURE", raw, detail: `${what}: public key present, signature absent.` };
+
+  const pkBytes  = bytesOfLength(pkField, [32, 65], 0);
+  const sigBytes = bytesOfLength(sigField, [64], 0);
+  if (!pkBytes)
+    return { ok: false, failure: "PUBLIC_KEY_UNREADABLE", raw,
+      detail: `${what}: could not read 32 or 65 key bytes out of the public key field. ` +
+        `Shape received: ${JSON.stringify(pkField).slice(0, 200)}` };
+  if (!sigBytes)
+    return { ok: false, failure: "SIGNATURE_UNREADABLE", raw,
+      detail: `${what}: could not read 64 signature bytes. ` +
+        `Shape received: ${JSON.stringify(sigField).slice(0, 200)}` };
+  if (pkBytes.length !== 32)
+    return { ok: false, failure: "UNSUPPORTED_KEY_SCHEME", raw,
+      detail: `${what}: ${pkBytes.length}-byte key. This page only rebuilds Ed25519 ` +
+        `authenticators; a secp256k1 or keyless account needs its own path.` };
+
+  // Which authenticator variant the chain expects follows from the ACCOUNT, not
+  // from a guess: whichever derivation reproduces the connected address is the
+  // scheme that account actually uses.
+  const ed = new Ed25519PublicKey(pkBytes);
+  const single = new AnyPublicKey(ed);
+  const conn = String(connectedAddress || "").toLowerCase();
+  const derive = (k) => { try { return String(k.authKey().derivedAddress()).toLowerCase(); } catch { return null; } };
+  const edAddr = derive(ed), skAddr = derive(single);
+
+  let scheme = null;
+  if (conn && edAddr === conn) scheme = "ed25519";
+  else if (conn && skAddr === conn) scheme = "single_key";
+  if (!scheme)
+    return { ok: false, failure: "SIGNING_KEY_IS_NOT_THE_CONNECTED_ACCOUNT", raw,
+      detail: `${what}: the returned key derives to neither the connected address under ` +
+        `Ed25519 nor under SingleKey.\n  connected:  ${conn}\n  ed25519:    ${edAddr}\n` +
+        `  single_key: ${skAddr}\nA signature from a key that is not this account's would ` +
+        `be rejected on chain. Do not submit it.` };
+
+  // Signing is not the test. Signing THE RIGHT MESSAGE is. A wallet handed the
+  // inner RawTransaction signs the PLAIN message (223 bytes) rather than the
+  // fee-payer message (257), returns a well-formed authenticator, and the chain
+  // rejects it as INVALID_SIGNATURE - which reads as a wallet bug and is not one.
+  if (!expectedMsg)
+    return { ok: false, failure: "NO_EXPECTED_MESSAGE", raw,
+      detail: "the page has no signing message to verify against; this is a bug in the page." };
+  let verified;
+  try {
+    verified = scheme === "ed25519"
+      ? ed.verifySignature({ message: expectedMsg, signature: new Ed25519Signature(sigBytes) })
+      : single.verifySignature({ message: expectedMsg, signature: new AnySignature(new Ed25519Signature(sigBytes)) });
+  } catch (e) {
+    return { ok: false, failure: "VERIFY_THREW", raw, detail: err(e) };
+  }
+  if (!verified)
+    return { ok: false, failure: "SIGNATURE_OVER_WRONG_MESSAGE", raw,
+      detail: `${what}: a valid-looking signature that does NOT match the fee-payer ` +
+        `transaction being submitted. Submitting it would fail with INVALID_SIGNATURE. ` +
+        `The usual cause is the wallet signing the inner RawTransaction, whose message is ` +
+        `structurally different and a different length from the fee-payer one.` };
+
+  // Built here, from bytes that have just been verified. The wallet's own object
+  // is never forwarded, which is why submit cannot fail on its shape.
+  const auth = scheme === "ed25519"
+    ? new AccountAuthenticatorEd25519(ed, new Ed25519Signature(sigBytes))
+    : new AccountAuthenticatorSingleKey(single, new AnySignature(new Ed25519Signature(sigBytes)));
+  const bytes = serialised(auth);
+  if (!bytes)
+    return { ok: false, failure: "AUTHENTICATOR_NOT_SERIALISABLE", raw,
+      detail: `${what}: the rebuilt ${scheme} authenticator would not serialise. This is a ` +
+        `bug in the page, not the wallet.` };
+
+  return { ok: true, auth, scheme, bytes: hexOf(bytes),
+    REBUILT_FROM_VERIFIED_BYTES: true,
+    publicKey: hexOf(pkBytes), derivedAddress: scheme === "ed25519" ? edAddr : skAddr };
+}
+
+// --- the network under test vs the network the wallet is on ----------------
+//
+// Backpack reported "aptos:mainnet" while the escrow is on testnet. Signing
+// against the wrong chain is a whole class of confusing failure - and it is
+// checkable at connect time, before anything is signed.
+//
+// The two wallets seen so far report it differently: Petra as the numeric chain
+// id 2, Backpack as the CAIP-2-style string "aptos:mainnet". Normalise both.
+const CHAIN_IDS = { mainnet: 1, testnet: 2 };
+function normaliseChain(v) {
+  const out = { raw: v, id: null, name: null };
+  const walk = (x, d) => {
+    if (x == null || d > 3) return;
+    if (typeof x === "number") { if (out.id === null) out.id = x; return; }
+    if (typeof x === "string") {
+      const m = x.toLowerCase().match(/(mainnet|testnet|devnet|local)/);
+      if (m && !out.name) { out.name = m[1]; if (out.id === null && CHAIN_IDS[m[1]]) out.id = CHAIN_IDS[m[1]]; }
+      else if (/^\d+$/.test(x) && out.id === null) out.id = Number(x);
+      return;
+    }
+    if (typeof x === "object")
+      for (const k of ["chainId", "chain_id", "name", "network", "chain", "value"]) if (k in x) walk(x[k], d + 1);
+  };
+  walk(v, 0);
+  if (out.id !== null && !out.name)
+    out.name = Object.keys(CHAIN_IDS).find((n) => CHAIN_IDS[n] === out.id) ?? null;
+  return out;
+}
+
+async function walletChain() {
+  const tries = PATH === "AIP-62"
+    ? [["aptos:network", () => W.features["aptos:network"]?.network?.()],
+       ["aptos:getNetwork", () => W.features["aptos:getNetwork"]?.getNetwork?.()],
+       ["connect response", () => ACCOUNT]]
+    : [["window.aptos.network()", () => window.aptos.network?.()],
+       ["connect response", () => ACCOUNT]];
+  for (const [src, fn] of tries) {
+    try {
+      const r = await fn();
+      if (r == null) continue;
+      const u = r && r.status !== undefined ? unwrap(r, src) : { ok: true, value: r };
+      if (!u.ok) continue;
+      const n = normaliseChain(u.value);
+      if (n.id !== null || n.name !== null) return { source: src, ...n };
+    } catch (_) {}
+  }
+  return { source: null, raw: null, id: null, name: null };
+}
+
+
 // --- 0. discovery ----------------------------------------------------------
 $("detect").onclick = () => {
   const listed = [];
@@ -256,17 +491,62 @@ $("detect").onclick = () => {
 $("connect").onclick = async () => {
   try {
     if (CHOSEN === null && WALLETS.length) CHOSEN = 0;
+    let res;
     if (CHOSEN !== "legacy" && WALLETS.length) {
       W = WALLETS[CHOSEN]; PATH = "AIP-62";
-      const res = await W.features["aptos:connect"].connect();
-      ACCOUNT = res.args ?? res.account ?? res;
+      res = await W.features["aptos:connect"].connect();
     } else if (window.aptos) {
       W = window.aptos; PATH = "legacy";
-      ACCOUNT = await window.aptos.connect();
+      res = await window.aptos.connect();
     } else { throw new Error("no wallet found — click Detect first"); }
-    const addr = String(ACCOUNT.address ?? ACCOUNT.accountAddress ?? "");
-    show($("out0"), { path: PATH, wallet: W.name || "window.aptos", address: addr, raw: ACCOUNT }, true);
-    $("step1").disabled = false;
+
+    // Through the gate, not `res.args ?? res`. A refused connect used to become
+    // ACCOUNT = {status:"Rejected"}, an empty address, and an enabled step 1.
+    const u = unwrap(res, "aptos:connect");
+    if (!u.ok) { ACCOUNT = null; show($("out0"), { CONNECTED: false, ...u }, false); return; }
+    ACCOUNT = u.value;
+    const addr = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
+    if (!addr) {
+      show($("out0"), { CONNECTED: false, failure: "NO_ADDRESS_IN_RESPONSE",
+        detail: "the wallet approved the connection but returned no address", raw: ACCOUNT }, false);
+      return;
+    }
+
+    // Which chain is the wallet on, and is it the one we are testing against?
+    const node = await (async () => {
+      try { const li = await aptos.getLedgerInfo(); return { id: Number(li.chain_id) }; }
+      catch (e) { return { id: null, error: err(e) }; }
+    })();
+    const wc = await walletChain();
+    const nodeName = Object.keys(CHAIN_IDS).find((n) => CHAIN_IDS[n] === node.id) ?? null;
+
+    let chain;
+    if (node.id === null) chain = { AGREE: null, why: "could not read chain_id from the fullnode" };
+    else if (wc.id === null && wc.name === null) chain = { AGREE: null,
+      why: "the wallet does not report its network through any method this page knows. " +
+           "Check it by hand before trusting step 2." };
+    else if (wc.id !== null) chain = { AGREE: wc.id === node.id };
+    else chain = { AGREE: wc.name === nodeName };
+
+    const mismatch = chain.AGREE === false;
+    show($("out0"), { path: PATH, wallet: W.name || "window.aptos", address: addr,
+      networkUnderTest: { chainId: node.id, name: nodeName, error: node.error },
+      walletNetwork: { chainId: wc.id, name: wc.name, reportedAs: wc.raw, readFrom: wc.source },
+      NETWORKS_AGREE: chain.AGREE, note: chain.why,
+      BLOCKED: mismatch ? "WRONG_NETWORK" : undefined,
+      whatToDo: mismatch
+        ? `The wallet is on ${wc.name ?? wc.id} and the escrow is on ${nodeName ?? node.id}. ` +
+          `Every step below would fail, and the failures would look like wallet limitations ` +
+          `rather than a network mismatch, so they are disabled.\n\n` +
+          `Switch the wallet to ${nodeName ?? "the network under test"} and connect again. In ` +
+          `Backpack that is Settings -> Preferences -> enable Developer Mode, then the network ` +
+          `selector at the top of the wallet menu -> Add Network.`
+        : undefined,
+      raw: ACCOUNT }, !mismatch);
+
+    // Refuse to proceed rather than produce findings that are really this.
+    $("step1").disabled = mismatch;
+    if (mismatch) { $("step2").disabled = true; $("step3").disabled = true; }
   } catch (e) { show($("out0"), err(e), false); }
 };
 
@@ -359,20 +639,41 @@ $("step1").onclick = async () => {
     let res;
     if (PATH === "AIP-62") res = await W.features["aptos:signMessage"].signMessage({ message, nonce });
     else res = await window.aptos.signMessage({ message, nonce });
-    const out = res.args ?? res;
+
+    // Same gate as everywhere else: `res.args ?? res` would report a refusal as a
+    // signature here too.
+    const u = unwrap(res, "aptos:signMessage");
+    if (!u.ok) { show($("out1"), { SIGNED: false, ...u }, false); return; }
+    const out = u.value;
 
     // The check that matters: does the returned key derive to the connected
     // address? A valid signature from ANY key would otherwise verify ANY address.
+    //
+    // The key is turned into BYTES first. Backpack returns it as
+    // {"type":"Buffer","data":[...]} - a Node Buffer through JSON.stringify -
+    // which has no authKey() or derivedAddress(), so reading methods off it
+    // reported "<no derivedAddress()>" for a key that was perfectly good.
     const connected = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
-    let derived = null, matches = null;
-    try {
-      const pk = out.publicKey ?? ACCOUNT?.publicKey;
-      derived = pk ? String((pk.authKey ? pk.authKey() : pk).derivedAddress?.() ?? "<no derivedAddress()>") : "<no publicKey returned>";
-      matches = derived !== null && derived.toLowerCase() === connected.toLowerCase();
-    } catch (e) { derived = err(e); }
+    const pkRaw = out.publicKey ?? out.public_key ?? ACCOUNT?.publicKey;
+    const pkBytes = bytesOfLength(pkRaw, [32], 0);
+    let derived = null, matches = null, scheme = null;
+    if (!pkRaw) derived = "<no publicKey returned>";
+    else if (!pkBytes) derived = "<could not read 32 key bytes from " + JSON.stringify(pkRaw).slice(0, 120) + ">";
+    else {
+      const ed = new Ed25519PublicKey(pkBytes), sk = new AnyPublicKey(ed);
+      const d = (k) => { try { return String(k.authKey().derivedAddress()).toLowerCase(); } catch { return null; } };
+      const c = connected.toLowerCase();
+      if (d(ed) === c)      { derived = d(ed); matches = true; scheme = "ed25519"; }
+      else if (d(sk) === c) { derived = d(sk); matches = true; scheme = "single_key"; }
+      else { derived = { ed25519: d(ed), single_key: d(sk) }; matches = false; }
+    }
 
     show($("out1"), { path: PATH, RAW_RESULT: out, connectedAddress: connected,
-      derivedFromReturnedKey: derived, DERIVES_TO_CONNECTED_ADDRESS: matches }, matches !== false);
+      publicKeyShape: pkRaw && typeof pkRaw === "object" && pkRaw.type === "Buffer"
+        ? 'JSON-serialised Node Buffer {"type":"Buffer","data":[...]} — normalised' : typeof pkRaw,
+      publicKeyBytes: pkBytes ? hexOf(pkBytes) : null,
+      derivedFromReturnedKey: derived, accountScheme: scheme,
+      DERIVES_TO_CONNECTED_ADDRESS: matches }, matches !== false);
   } catch (e) { show($("out1"), err(e), false); }
 };
 
@@ -436,53 +737,73 @@ $("step2").onclick = async () => {
       : [["window.aptos.signTransaction(txn)", () => window.aptos.signTransaction(TXN)],
          ["window.aptos.signTransaction({transaction})", () => window.aptos.signTransaction({ transaction: TXN })]];
 
-    // Signing is not the test. Signing THE RIGHT MESSAGE is.
+    // Every shape goes through the same gate, and only a VERIFIED authenticator
+    // is accepted. There is deliberately no "could not verify, let the chain
+    // decide" path: an unverifiable response is a failure with a name.
     //
-    // A wallet can return a valid signature over the wrong payload, which the
-    // chain then rejects as INVALID_SIGNATURE - a failure that reads as a wallet
-    // bug and is really a message-shape mismatch. Verifying locally turns that
-    // into a precise finding here, before anything is submitted.
-    function verifies(auth) {
-      try {
-        const pk = auth?.public_key ?? auth?.publicKey;
-        const sig = auth?.signature;
-        if (!pk || !sig || !EXPECTED_MSG) return null;
-        return pk.verifySignature({ message: EXPECTED_MSG, signature: sig });
-      } catch (e) { return { verifyError: err(e) }; }
-    }
-
+    // Before this, a shape whose signature could not be checked locally reported
+    //   SIGNATURE_MATCHES_EXPECTED_MESSAGE: null
+    //   note: "step 3 will tell you whether the chain accepts it"
+    // and set SENDER_AUTH anyway. `null` was doing double duty - "this is an
+    // authenticator I cannot verify" and "this is not an authenticator at all" -
+    // so a refusal took the same branch as a signature.
+    let RESULT = null;
     for (const [label, fn] of tries) {
-      try {
-        const r = await fn();
-        const auth = r.args ?? r.authenticator ?? r;
-        const ok = verifies(auth);
-        attempts.push({ shape: label, RESULT: "signed", SIGNATURE_MATCHES_EXPECTED_MESSAGE: ok });
-        if (ok === true) { SENDER_AUTH = auth; break; }
-        if (ok === false) attempts[attempts.length - 1].note =
-          "signed, but over a DIFFERENT message than the fee-payer transaction " +
-          "being submitted. Submitting this would fail with INVALID_SIGNATURE.";
-        if (ok === null) { SENDER_AUTH = auth; attempts[attempts.length - 1].note =
-          "signed, but this page could not verify the signature locally - " +
-          "step 3 will tell you whether the chain accepts it."; break; }
-      } catch (e) { attempts.push({ shape: label, VERBATIM_ERROR: err(e) }); }
+      let r;
+      try { r = await fn(); }
+      catch (e) { attempts.push({ shape: label, RESULT: "THREW", VERBATIM_ERROR: err(e) }); continue; }
+
+      const g = senderAuthenticator(r, label, EXPECTED_MSG,
+                                    String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? ""));
+      if (g.ok) {
+        attempts.push({ shape: label, RESULT: "VERIFIED", scheme: g.scheme,
+                        SIGNATURE_MATCHES_EXPECTED_MESSAGE: true });
+        RESULT = g; SENDER_AUTH = g.auth; break;
+      }
+      attempts.push({ shape: label, RESULT: "REFUSED_OR_UNUSABLE", FAILURE: g.failure,
+                      detail: g.detail, rawResponse: g.raw });
     }
 
-    if (!SENDER_AUTH) { show($("out2"), { SIGNED: false, feePayer: SPONSOR, attempts }, false); return; }
+    if (!RESULT) {
+      const names = [...new Set(attempts.map((a) => a.FAILURE).filter(Boolean))];
+      show($("out2"), { SIGNED: false, feePayer: SPONSOR, FAILURES: names, attempts,
+        note: names.includes("WALLET_REJECTED")
+          ? "At least one shape was REFUSED by the wallet. A refusal is not a missing " +
+            "capability: check whether the wallet is on the network under test, and whether " +
+            "its own UI showed a prompt at all."
+          : undefined }, false);
+      $("step3").disabled = true;
+      return;
+    }
     $("step3").disabled = false;
-    show($("out2"), { SIGNED: true, feePayer: SPONSOR, attempts, authenticator: SENDER_AUTH }, true);
+    show($("out2"), { SIGNED: true, VERIFIED_LOCALLY: true, feePayer: SPONSOR, attempts,
+      authenticator: { scheme: RESULT.scheme, publicKey: RESULT.publicKey,
+                       derivedAddress: RESULT.derivedAddress,
+                       REBUILT_FROM_VERIFIED_BYTES: true, bcs: RESULT.bytes } }, true);
   } catch (e) { show($("out2"), err(e), false); }
 };
 
 // --- 3. submit sponsored ---------------------------------------------------
 $("step3").onclick = async () => {
   try {
+    // SENDER_AUTH is only ever set from senderAuthenticator()'s ok branch, so by
+    // the time it is read here it has been verified against EXPECTED_MSG and has
+    // already been serialised once. This guard is the belt to that braces: the
+    // previous version read it unconditionally and produced
+    //   TypeError: SENDER_AUTH.serialize is not a function
+    // three steps away from the refusal that caused it.
+    if (!SENDER_AUTH || typeof SENDER_AUTH.serialize !== "function") {
+      show($("out3"), { SUBMITTED: false, failure: "NO_VERIFIED_AUTHENTICATOR",
+        detail: "step 3 was reached without step 2 producing a verified authenticator. " +
+                "Nothing is submitted. Re-run step 2 and read its FAILURE name." }, false);
+      return;
+    }
     const ser = new Serializer(); TXN.serialize(ser);
-    const hex = (u8) => "0x" + [...u8].map(b => b.toString(16).padStart(2, "0")).join("");
     const aser = new Serializer(); SENDER_AUTH.serialize(aser);
 
     const res = await fetch("/sponsor", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ transaction: hex(ser.toUint8Array()), senderAuth: hex(aser.toUint8Array()) }),
+      body: JSON.stringify({ transaction: hexOf(ser.toUint8Array()), senderAuth: hexOf(aser.toUint8Array()) }),
     });
     show($("out3"), await res.json(), true);
   } catch (e) { show($("out3"), err(e), false); }

@@ -4,7 +4,7 @@
   "description": "",
   "main": "serve.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node boundary.test.mjs",
     "build": "esbuild vendor/entry.js --bundle --format=esm --platform=browser --outfile=vendor/ts-sdk.mjs"
   },
   "keywords": [],

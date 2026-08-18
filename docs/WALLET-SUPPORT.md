@@ -45,9 +45,30 @@ copy may not treat it as one.
 |---|---|---|---|---|---|
 | **Petra** (AIP-62) | ✅ | ✅ derives to connected address | ✅ `{rawTransaction, feePayerAddress: AccountAddress}` | ✅ [`0xe33e61b8…802b83`](https://explorer.aptoslabs.com/txn/0xe33e61b8b63a49f4fee77f21459a69b039cecd22efa423f3f60dc732d2802b83?network=testnet) | 18 Aug 2026 |
 | **Aptos Connect** (Google) | — | — | — | — | not yet run |
-| **Backpack** | — | — | — | — | not yet run |
+| **Backpack** | ✅ | ✅ | ⚠️ inconclusive — wallet was on **mainnet** | — | 18 Aug 2026, void |
 
-Escrows are provisioned and funded for the two outstanding rows. Each is
+**Backpack's row is deliberately not a verdict.** It was connected to mainnet
+while the escrow is on testnet, so its refusal says nothing about whether it can
+sign as sender. Recording it as incapable would be a false negative that then
+propagated into copy — the same defect as recording an untested wallet as
+capable, in the other direction. It needs a re-run on testnet, and the escrow is
+ready for it: `wallet-check-backpack` is published, funded 100,000, and
+`is_claimed: false`.
+
+Two things came out of that run anyway, and both are now permanent:
+
+- **The page refuses to proceed on a network mismatch.** Connect compares the
+  wallet's reported chain against the fullnode's `chain_id` and disables every
+  step below if they differ. Petra reports it as the number `2`, Backpack as the
+  string `"aptos:mainnet"`; both are normalised. Without this, every downstream
+  failure looks like a wallet limitation.
+- **A refusal can no longer be reported as a signature.** Backpack answered
+  `{status:"Rejected"}` and the page printed `SIGNED: true`, because it read
+  `args` without reading `status`. There is now one gate that turns a wallet
+  response into a verified authenticator or a named failure, and nothing
+  downstream accepts anything else. See the tool's README.
+
+Escrows are provisioned and funded for the outstanding rows. Each is
 initialised with 100,000 USDC minor units (0.1 USDC) and a 30-day window; neither
 has a root, because **the leaf commits to the claiming address** and that address
 is not known until the wallet connects.
@@ -55,7 +76,7 @@ is not known until the wallet connects.
 | Event id | Escrow object | Root |
 |---|---|---|
 | `wallet-check-connect` | `0xabf6ab4133004c4231aced2acff42cade54554367171bea081b8742e88c3c6d7` | pending an address |
-| `wallet-check-backpack` | `0x3bde1c88f2c524d7be14b6767411263e5aa10e2471b3fb933152ed2d96231135` | pending an address |
+| `wallet-check-backpack` | `0x3bde1c88f2c524d7be14b6767411263e5aa10e2471b3fb933152ed2d96231135` | published, unclaimed — reusable |
 
 Connect the wallet, then publish:
 
@@ -153,3 +174,8 @@ the same way.
 
 Re-run the check when a wallet ships a major version. This is a wallet-behaviour
 record with a shelf life, not a property of our contract.
+
+And a rule the Backpack run earned: **a failure only goes in the table once the
+setup is known good.** A wallet on the wrong network, or a page bug, produces
+findings shaped exactly like wallet limitations. "Inconclusive" is a legitimate
+cell value here; a guess is not.

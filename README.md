@@ -252,6 +252,22 @@ each step locks permanently. The short version: `publish_root` is the point of n
 return for shortening a claim window, because `extend_deadline` can only move a
 deadline later.
 
+## Verifying a sponsored claim
+
+`scripts/sponsored-claim.js` runs the check that produced the first real claim:
+the claimant receives the full amount and pays no gas, and the sponsor's balance
+moves by exactly the fee.
+
+The property it proves is the one that makes sponsorship safe to offer — the
+contributor signs as **sender** of a fee-payer transaction, so the sponsor pays
+and gains no authority. Note what it cannot prove: a Move unit test cannot
+construct a fee-payer transaction, so the transaction-layer guarantee is AIP-39's
+and has to be observed rather than asserted. This script is that observation.
+
+It also happens to be the shape wallet support varies on, so it doubles as the
+wallet compatibility check — swap the local key for a wallet signer and leave the
+rest alone.
+
 ## Building and testing
 
 Requires the Aptos CLI.

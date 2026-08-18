@@ -193,6 +193,25 @@ function identBytes() {
   for (let i = 0; i < 32; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
   return out;
 }
+// Event id, as BYTES.
+//
+// This field caused the same bug as the identity hash, one fix later: the page
+// passed "0x77616c6c..." as a string, the SDK serialised it as a Move string,
+// and escrow_address() hashed the ASCII of the hex rather than the bytes. It
+// returned a perfectly valid address that nothing had ever been published to -
+// so every later view aborted with E_NOT_INITIALISED.
+//
+// Three instances of one mistake in one file. The lesson is not "check the
+// arguments": it is that a vector<u8> argument must never be built at a call
+// site. Every one of them now comes from a function here, and there is no
+// variant that returns a string.
+function eventBytes() {
+  const v = $("event").value.trim();
+  if (!v) throw new Error("event id is empty");
+  if (/\s/.test(v)) throw new Error(
+    `event id must not contain whitespace; got ${JSON.stringify(v)}`);
+  return new TextEncoder().encode(v);
+}
 function amountArg() {
   const v = $("amount").value.trim();
   if (!/^\d+$/.test(v) || Number(v) <= 0) throw new Error(
@@ -251,42 +270,81 @@ $("connect").onclick = async () => {
 };
 
 // --- escrow derivation -----------------------------------------------------
+// A view either returns a value or aborts. Collapsing those into one variable
+// is what let a FAILED CALL be reported as a ROOT MISMATCH - a confident wrong
+// answer that sent the reader looking for an address discrepancy that did not
+// exist. The distinction is now in the type.
+async function tryView(payload) {
+  try { const r = await aptos.view({ payload }); return { ok: true, value: r[0] }; }
+  catch (e) {
+    const m = String(e && e.message || e);
+    return { ok: false, abort: (m.match(/E_[A-Z_]+\(0x[0-9a-f]+\)/) || [null])[0], error: err(e) };
+  }
+}
+const val = (r) => (r && r.ok ? r.value : undefined);
+
 $("derive").onclick = async () => {
   try {
     const mod = $("module").value.trim();
-    const eventHex = "0x" + [...new TextEncoder().encode($("event").value.trim())]
-      .map(b => b.toString(16).padStart(2, "0")).join("");
     const addr = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
     if (!addr) throw new Error("connect a wallet first — the leaf commits to its address");
 
+    // Bytes, not a hex string. See eventBytes().
     const [escrow] = await aptos.view({ payload: {
-      function: `${mod}::escrow::escrow_address`, functionArguments: [mod, eventHex] }});
+      function: `${mod}::escrow::escrow_address`, functionArguments: [mod, eventBytes()] }});
     // Bytes, not the hex string. See identBytes().
     const [leaf] = await aptos.view({ payload: {
       function: `${mod}::escrow::leaf_for`,
       functionArguments: [addr, identBytes(), amountArg()] }});
     ESCROW = escrow; LEAF = leaf;
 
-    let onChainRoot = null, claimed = null, bal = null;
-    try { [onChainRoot] = await aptos.view({ payload: { function: `${mod}::escrow::root`, functionArguments: [escrow] }}); } catch (e) { onChainRoot = err(e); }
-    try { [claimed] = await aptos.view({ payload: { function: `${mod}::escrow::is_claimed`, functionArguments: [escrow, leaf] }}); } catch (e) { claimed = err(e); }
-    try { [bal] = await aptos.view({ payload: { function: `${mod}::escrow::balance`, functionArguments: [escrow] }}); } catch (e) { bal = err(e); }
+    const rootR    = await tryView({ function: `${mod}::escrow::root`, functionArguments: [escrow] });
+    const claimedR = await tryView({ function: `${mod}::escrow::is_claimed`, functionArguments: [escrow, leaf] });
+    const balR     = await tryView({ function: `${mod}::escrow::balance`, functionArguments: [escrow] });
 
-    const rootMatches = onChainRoot && String(onChainRoot.vec ? onChainRoot.vec[0] : onChainRoot) === String(leaf);
     const problems = [];
-    if (claimed === true) problems.push(
-      "ALREADY CLAIMED — this leaf has been claimed on chain, so step 3 will abort " +
-      "with E_ALREADY_CLAIMED. A claimed leaf cannot be reclaimed. Use a FRESH event id: " +
-      "./setup-escrow.sh <your-address> wallet-check-<something-new>");
-    if (onChainRoot && !rootMatches) problems.push(
-      "ROOT MISMATCH — the published root is not this leaf, so the proof will not verify. " +
-      "Either the escrow was published for a different address, or the amount or identity " +
-      "hash differs from the one setup-escrow.sh used.");
-    if (!onChainRoot || (onChainRoot.vec && onChainRoot.vec.length === 0)) problems.push(
-      "NO ROOT PUBLISHED — run setup-escrow.sh for this event id first.");
+    const failed = [["root", rootR], ["is_claimed", claimedR], ["balance", balR]].filter(([, r]) => !r.ok);
 
-    show($("outE"), { escrow, leaf, claimantAddress: addr, onChainRoot, alreadyClaimed: claimed,
-      escrowBalance: bal, rootMatchesLeaf: rootMatches,
+    // A failed call is reported as a failed call. It is NOT compared to
+    // anything, because there is nothing to compare.
+    if (failed.length) {
+      const aborts = [...new Set(failed.map(([, r]) => r.abort).filter(Boolean))];
+      problems.push(
+        `VIEW CALL FAILED — ${failed.map(([n]) => n).join(", ")} aborted` +
+        (aborts.length ? ` with ${aborts.join(", ")}` : "") +
+        ". Nothing below is a comparison; the chain did not answer.");
+      if (aborts.includes("E_NOT_INITIALISED(0x2)")) problems.push(
+        `NO ESCROW AT THE DERIVED ADDRESS — ${escrow}\n` +
+        "Nothing has been initialised there. Compare that address with the one " +
+        "setup-escrow.sh printed: if they differ, the page and the script are deriving " +
+        "different escrows for the same event id, which is a bug in this tool, not in " +
+        "your setup. If they match, run setup-escrow.sh for this event id.");
+    }
+
+    // Only compare once there is a value to compare.
+    let rootMatches;
+    if (rootR.ok) {
+      const published = rootR.value && rootR.value.vec ? rootR.value.vec[0] : rootR.value;
+      if (!published) {
+        problems.push("NO ROOT PUBLISHED — the escrow exists but has no root. Run setup-escrow.sh for this event id.");
+      } else {
+        rootMatches = String(published) === String(leaf);
+        if (!rootMatches) problems.push(
+          "ROOT MISMATCH — the escrow published a root, and it is not this leaf, so the proof " +
+          "will not verify. The address, the amount or the identity hash differs from the one " +
+          "setup-escrow.sh used.");
+      }
+    }
+    if (claimedR.ok && claimedR.value === true) problems.push(
+      "ALREADY CLAIMED — this leaf has been claimed on chain, so step 3 will abort with " +
+      "E_ALREADY_CLAIMED. A claimed leaf cannot be reclaimed. Use a FRESH event id: " +
+      "./setup-escrow.sh <your-address> wallet-check-<something-new>");
+
+    show($("outE"), { escrow, leaf, claimantAddress: addr,
+      root: rootR.ok ? rootR.value : { CALL_FAILED: rootR.abort, detail: rootR.error },
+      alreadyClaimed: claimedR.ok ? claimedR.value : { CALL_FAILED: claimedR.abort, detail: claimedR.error },
+      escrowBalance: balR.ok ? balR.value : { CALL_FAILED: balR.abort, detail: balR.error },
+      rootMatchesLeaf: rootMatches,
       READY: problems.length === 0, problems }, problems.length === 0);
     $("step2").disabled = problems.length !== 0;
   } catch (e) { show($("outE"), err(e), false); }

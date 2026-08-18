@@ -1,0 +1,232 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Aptos wallet capability check</title>
+<style>
+  :root { --ink:#1C1A24; --mute:#6B6779; --rule:#DFDBD2; --ok:#2F6B4F; --bad:#A33A32; --accent:#4B3F8F; }
+  body { font: 15px/1.55 system-ui, sans-serif; color: var(--ink); max-width: 60rem;
+         margin: 2rem auto; padding: 0 1.5rem 6rem; background: #FBFAF7; }
+  h1 { font: 600 1.6rem/1.2 Georgia, serif; margin: 0 0 .3rem; }
+  .sub { color: var(--mute); margin: 0 0 1.5rem; }
+  fieldset { border: 1px solid var(--rule); margin: 0 0 1rem; padding: .9rem 1rem; }
+  legend { font: 600 .72rem/1 ui-monospace, monospace; letter-spacing:.1em; text-transform:uppercase; color: var(--mute); }
+  label { display:block; font-size:.78rem; color:var(--mute); margin:.5rem 0 .15rem; }
+  input { width:100%; font:12px ui-monospace, monospace; padding:.35rem .5rem; border:1px solid var(--rule); background:#fff; }
+  button { font:600 .85rem system-ui; padding:.5rem .9rem; margin:.35rem .35rem .35rem 0;
+           border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.sec { background:#fff; color:var(--accent); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  pre { font:12px/1.5 ui-monospace, monospace; background:#F3F1EC; border:1px solid var(--rule);
+        border-left:3px solid var(--accent); padding:.8rem; overflow-x:auto; white-space:pre-wrap;
+        word-break:break-word; margin:.5rem 0 0; }
+  pre.ok { border-left-color: var(--ok); }
+  pre.bad { border-left-color: var(--bad); }
+  .row { display:flex; gap:1rem; flex-wrap:wrap; }
+  .row > div { flex:1 1 18rem; }
+</style>
+
+<h1>Aptos wallet capability check</h1>
+<p class="sub">Three steps, run separately. Every result is printed raw — the point is the verbatim
+output, including errors, not an interpretation of them.</p>
+
+<fieldset>
+  <legend>0 · Wallet</legend>
+  <button id="detect">Detect wallets</button>
+  <button id="connect" class="sec">Connect</button>
+  <pre id="out0">Click "Detect wallets" first.</pre>
+</fieldset>
+
+<fieldset>
+  <legend>Escrow under test</legend>
+  <div class="row">
+    <div><label>Module address</label><input id="module" value="0x1b419fe2b8c2a694eda8398af4bb6f6980915f9e3ed856b3b0fb4f26597f22c9"></div>
+    <div><label>Event id (utf8)</label><input id="event" value="wallet-check"></div>
+  </div>
+  <div class="row">
+    <div><label>Identity hash (32 bytes hex)</label><input id="ident" value="0x2222222222222222222222222222222222222222222222222222222222222222"></div>
+    <div><label>Amount (USDC minor units)</label><input id="amount" value="100000"></div>
+  </div>
+  <button id="derive" class="sec">Derive escrow + leaf</button>
+  <pre id="outE">Run setup-escrow.sh with your connected address first, then derive.</pre>
+</fieldset>
+
+<fieldset>
+  <legend>1 · signMessage, and does the key derive to the address</legend>
+  <button id="step1" disabled>Run step 1</button>
+  <pre id="out1">Connect first.</pre>
+</fieldset>
+
+<fieldset>
+  <legend>2 · Sign as SENDER of a fee-payer transaction (not submitted)</legend>
+  <button id="step2" disabled>Run step 2</button>
+  <pre id="out2">Connect and derive first.</pre>
+</fieldset>
+
+<fieldset>
+  <legend>3 · Submit the sponsored claim end to end</legend>
+  <button id="step3" disabled>Run step 3</button>
+  <pre id="out3">Run step 2 first.</pre>
+</fieldset>
+
+<script type="module">
+import {
+  Aptos, AptosConfig, Network, Hex, MoveVector, Serializer,
+} from "https://esm.sh/@aptos-labs/ts-sdk@7.3.0";
+import { getAptosWallets } from "https://esm.sh/@aptos-labs/wallet-standard@2.0.0";
+
+const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+const $ = (id) => document.getElementById(id);
+const show = (el, v, ok) => {
+  el.className = ok === true ? "ok" : ok === false ? "bad" : "";
+  el.textContent = typeof v === "string" ? v : JSON.stringify(v, safe, 2);
+};
+// Print everything, including things JSON normally drops.
+function safe(k, v) {
+  if (typeof v === "bigint") return v.toString() + "n";
+  if (v instanceof Uint8Array) return "0x" + [...v].map(b => b.toString(16).padStart(2, "0")).join("");
+  if (v instanceof Error) return { name: v.name, message: v.message, code: v.code, stack: v.stack };
+  return v;
+}
+const err = (e) => ({
+  VERBATIM: String(e && e.message || e),
+  name: e && e.name, code: e && e.code, status: e && e.status,
+  keys: e && typeof e === "object" ? Object.keys(e) : undefined,
+  stringified: (() => { try { return JSON.stringify(e); } catch { return "<unserialisable>"; } })(),
+  stack: e && e.stack,
+});
+
+let WALLETS = [], W = null, ACCOUNT = null, PATH = null;
+let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null;
+
+// --- 0. discovery ----------------------------------------------------------
+$("detect").onclick = () => {
+  const found = [];
+  try {
+    const { aptosWallets, on } = getAptosWallets();
+    WALLETS = aptosWallets || [];
+    for (const w of WALLETS) found.push({ standard: "AIP-62", name: w.name, version: w.version, features: Object.keys(w.features || {}) });
+  } catch (e) { found.push({ standard: "AIP-62", error: err(e) }); }
+  if (window.aptos) found.push({ standard: "legacy window.aptos", methods: Object.keys(window.aptos) });
+  show($("out0"), { detected: found.length, found }, found.length > 0);
+};
+
+$("connect").onclick = async () => {
+  try {
+    if (WALLETS.length) {
+      W = WALLETS[0]; PATH = "AIP-62";
+      const res = await W.features["aptos:connect"].connect();
+      ACCOUNT = res.args ?? res.account ?? res;
+    } else if (window.aptos) {
+      W = window.aptos; PATH = "legacy";
+      ACCOUNT = await window.aptos.connect();
+    } else { throw new Error("no wallet found — click Detect first"); }
+    const addr = String(ACCOUNT.address ?? ACCOUNT.accountAddress ?? "");
+    show($("out0"), { path: PATH, wallet: W.name || "window.aptos", address: addr, raw: ACCOUNT }, true);
+    $("step1").disabled = false;
+  } catch (e) { show($("out0"), err(e), false); }
+};
+
+// --- escrow derivation -----------------------------------------------------
+$("derive").onclick = async () => {
+  try {
+    const mod = $("module").value.trim();
+    const eventHex = "0x" + [...new TextEncoder().encode($("event").value.trim())]
+      .map(b => b.toString(16).padStart(2, "0")).join("");
+    const addr = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
+    if (!addr) throw new Error("connect a wallet first — the leaf commits to its address");
+
+    const [escrow] = await aptos.view({ payload: {
+      function: `${mod}::escrow::escrow_address`, functionArguments: [mod, eventHex] }});
+    const [leaf] = await aptos.view({ payload: {
+      function: `${mod}::escrow::leaf_for`,
+      functionArguments: [addr, $("ident").value.trim(), $("amount").value.trim()] }});
+    ESCROW = escrow; LEAF = leaf;
+
+    let onChainRoot = null, claimed = null, bal = null;
+    try { [onChainRoot] = await aptos.view({ payload: { function: `${mod}::escrow::root`, functionArguments: [escrow] }}); } catch (e) { onChainRoot = err(e); }
+    try { [claimed] = await aptos.view({ payload: { function: `${mod}::escrow::is_claimed`, functionArguments: [escrow, leaf] }}); } catch (e) { claimed = err(e); }
+    try { [bal] = await aptos.view({ payload: { function: `${mod}::escrow::balance`, functionArguments: [escrow] }}); } catch (e) { bal = err(e); }
+
+    show($("outE"), { escrow, leaf, claimantAddress: addr, onChainRoot, alreadyClaimed: claimed, escrowBalance: bal,
+      note: "root must equal leaf for a single-leaf tree, and alreadyClaimed must be false" }, true);
+    $("step2").disabled = false;
+  } catch (e) { show($("outE"), err(e), false); }
+};
+
+// --- 1. signMessage --------------------------------------------------------
+$("step1").onclick = async () => {
+  const nonce = crypto.randomUUID();
+  const message = `Grainlify address verification\nNonce: ${nonce}`;
+  try {
+    let res;
+    if (PATH === "AIP-62") res = await W.features["aptos:signMessage"].signMessage({ message, nonce });
+    else res = await window.aptos.signMessage({ message, nonce });
+    const out = res.args ?? res;
+
+    // The check that matters: does the returned key derive to the connected
+    // address? A valid signature from ANY key would otherwise verify ANY address.
+    const connected = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
+    let derived = null, matches = null;
+    try {
+      const pk = out.publicKey ?? ACCOUNT?.publicKey;
+      derived = pk ? String((pk.authKey ? pk.authKey() : pk).derivedAddress?.() ?? "<no derivedAddress()>") : "<no publicKey returned>";
+      matches = derived !== null && derived.toLowerCase() === connected.toLowerCase();
+    } catch (e) { derived = err(e); }
+
+    show($("out1"), { path: PATH, RAW_RESULT: out, connectedAddress: connected,
+      derivedFromReturnedKey: derived, DERIVES_TO_CONNECTED_ADDRESS: matches }, matches !== false);
+  } catch (e) { show($("out1"), err(e), false); }
+};
+
+// --- 2. sign as sender of a fee-payer transaction --------------------------
+$("step2").onclick = async () => {
+  try {
+    const mod = $("module").value.trim();
+    const addr = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
+    TXN = await aptos.transaction.build.simple({
+      sender: addr,
+      withFeePayer: true,                       // <-- the capability under test
+      options: { maxGasAmount: 20000 },
+      data: {
+        function: `${mod}::escrow::claim`,
+        functionArguments: [ESCROW, Hex.fromHexString($("ident").value.trim()).toUint8Array(),
+                            Number($("amount").value.trim()), new MoveVector([])],
+      },
+    });
+
+    // Wallets disagree about this call's shape. Try each and report which worked -
+    // that difference is itself a finding.
+    const attempts = [];
+    const tries = PATH === "AIP-62"
+      ? [["aptos:signTransaction({transaction})", () => W.features["aptos:signTransaction"].signTransaction({ transaction: TXN })],
+         ["aptos:signTransaction({rawTransaction})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction })],
+         ["aptos:signTransaction(txn)", () => W.features["aptos:signTransaction"].signTransaction(TXN)]]
+      : [["window.aptos.signTransaction(txn)", () => window.aptos.signTransaction(TXN)],
+         ["window.aptos.signTransaction({transaction})", () => window.aptos.signTransaction({ transaction: TXN })]];
+
+    for (const [label, fn] of tries) {
+      try { const r = await fn(); SENDER_AUTH = r.args ?? r.authenticator ?? r;
+            attempts.push({ shape: label, RESULT: "signed" }); break; }
+      catch (e) { attempts.push({ shape: label, VERBATIM_ERROR: err(e) }); }
+    }
+
+    if (!SENDER_AUTH) { show($("out2"), { SIGNED: false, attempts }, false); return; }
+    $("step3").disabled = false;
+    show($("out2"), { SIGNED: true, attempts, authenticator: SENDER_AUTH }, true);
+  } catch (e) { show($("out2"), err(e), false); }
+};
+
+// --- 3. submit sponsored ---------------------------------------------------
+$("step3").onclick = async () => {
+  try {
+    const ser = new Serializer(); TXN.serialize(ser);
+    const hex = (u8) => "0x" + [...u8].map(b => b.toString(16).padStart(2, "0")).join("");
+    const aser = new Serializer(); SENDER_AUTH.serialize(aser);
+
+    const res = await fetch("/sponsor", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction: hex(ser.toUint8Array()), senderAuth: hex(aser.toUint8Array()) }),
+    });
+    show($("out3"), await res.json(), true);
+  } catch (e) { show($("out3"), err(e), false); }
+};
+</script>

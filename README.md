@@ -252,6 +252,71 @@ each step locks permanently. The short version: `publish_root` is the point of n
 return for shortening a claim window, because `extend_deadline` can only move a
 deadline later.
 
+## Deployed: Aptos testnet
+
+Verified end to end on **18 August 2026** against real Circle USDC, including a
+sponsored claim by an account that had never existed on chain.
+
+| | |
+|---|---|
+| Network | Aptos **testnet** |
+| Module address | `0x1b419fe2b8c2a694eda8398af4bb6f6980915f9e3ed856b3b0fb4f26597f22c9` |
+| CLI profile | `grainlify-testnet` (`.aptos/config.yaml`, gitignored) |
+| Asset | Native Circle USDC, `0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832` |
+| Escrow object | `0xdd4fa63ec44e4726cd7d1118596866cd0c5d4cd4d3fcc9762a42261872795f45` |
+| Event id | `usdc-hook-test` |
+
+### Transactions
+
+| Step | Hash |
+|---|---|
+| `publish` | [`0x6c3aab86…4697e`](https://explorer.aptoslabs.com/txn/0x6c3aab864ec47779663b0bc93f2a23cab251e75af25a60bd5151de2a1154697e?network=testnet) |
+| `initialise` | [`0xd3e8dc46…d12c8`](https://explorer.aptoslabs.com/txn/0xd3e8dc468e8cd4d9675e0f997493642953c42fbebd9f16f41d24e6d8440d12c8?network=testnet) |
+| `fund` | [`0x441cbb15…240e1d`](https://explorer.aptoslabs.com/txn/0x441cbb153c284f8a595d942207c8a87121ee5c39d76114fcb24ef97e02240e1d?network=testnet) |
+| **`claim`, sponsored** | [**`0x1be03bd4…3396ba`**](https://explorer.aptoslabs.com/txn/0x1be03bd403c039f464f84b50c9a99f2b9a242d7fcdcbb1e693239cad493396ba?network=testnet) |
+
+**The claim is the one to point at.** The claimant
+(`0xd46acd05…9004dd`) was freshly generated and had never transacted — zero APT,
+zero USDC, no account on chain. It received exactly 1,000,000 USDC units and paid
+**zero** gas; the sponsor's balance moved by exactly `gas_used × gas_unit_price`
+and nothing else.
+
+That exercises both dispatchable-hook paths: withdraw from a primary store during
+`fund`, and deposit into a primary store **that had to be created** during the
+claim. Store-creation-on-deposit is what a first-time recipient hits, and it is
+the case that would otherwise have failed at the worst possible moment. No hook
+rejected anything.
+
+A replayed claim aborts:
+
+```
+Move abort in 0x1b41…22c9::escrow: E_ALREADY_CLAIMED(0x8)
+```
+
+### Gas, measured
+
+| Claim against | Gas units |
+|---|---|
+| APT (no hooks, local network) | 4,372 |
+| **USDC (dispatchable hooks + store creation)** | **14,920** |
+
+About 3.4× more, from the hooks plus creating the recipient's store. At 100 octas
+per unit that is **~0.0149 APT per claim**, so a 38-person pool costs roughly
+**0.57 APT** to sponsor entirely. The first claim per recipient is the expensive
+one, because that is when their store is created.
+
+### This profile is testnet only
+
+`grainlify-testnet` is a **testnet key holding no real value**, kept stable so
+later tests build on one deployment rather than scattering modules across
+throwaway addresses.
+
+**Mainnet will be a different account entirely, and a multisig.** Do not reach for
+this profile, this address, or this key when the time comes — nothing here is
+provisioned for value that matters, and the admin capability in this contract is
+an address comparison specifically because it composes with a multisig account
+rather than re-implementing one.
+
 ## Verifying a sponsored claim
 
 `scripts/sponsored-claim.js` runs the check that produced the first real claim:

@@ -12,9 +12,27 @@ whether a failure is a wallet limitation or our bug.
 
 ```sh
 cd tools/wallet-check
-npm install                 # once
-node serve.js               # http://localhost:8899
+npm install                                  # once
+npm run build                                # once — bundles the SDK locally
+node serve.js                                # http://localhost:8899
 ```
+
+**Restarting?** `pkill -f "node serve.js"` first. A stale copy keeps the port and
+answers with whatever routes it had when it started, which looks exactly like a
+broken page — it cost a debugging round trip here. The server now refuses to
+start rather than losing the race, but only if the old one is gone.
+
+The SDK is **bundled from `node_modules`, not fetched from a CDN.** Two earlier
+versions failed at import, both times because of dependency resolution rather
+than anything to do with wallets:
+
+1. `@aptos-labs/wallet-standard` declares `ts-sdk@^7.1.0` — a *range* — which
+   resolved to a build where `AnyPublicKey` had moved. Pinning our own import did
+   nothing, because the range belonged to the dependency.
+2. The pinned CDN bundle still failed to evaluate in the browser.
+
+A local bundle removes the class. The only things that can break now are this
+page and the wallet, which is what it exists to test.
 
 Then, in the browser:
 

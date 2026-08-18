@@ -4,7 +4,8 @@
   "description": "",
   "main": "serve.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "esbuild vendor/entry.js --bundle --format=esm --platform=browser --outfile=vendor/ts-sdk.mjs"
   },
   "keywords": [],
   "author": "",
@@ -12,5 +13,9 @@
   "type": "commonjs",
   "dependencies": {
     "@aptos-labs/ts-sdk": "^7.3.0"
-  }
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "private": true
 }

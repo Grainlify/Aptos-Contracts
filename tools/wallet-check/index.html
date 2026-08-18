@@ -73,8 +73,13 @@ output, including errors, not an interpretation of them.</p>
 // report that from inside itself - which is exactly what happened: no output, no
 // error in the page, and the reason only visible in the console.
 (function () {
-  var panel = null;
-  function report(title, detail) {
+  var panel = null, reported = false;
+  function report(title, detail, isWatchdog) {
+    // The watchdog must never overwrite a real error. It did, which is why the
+    // first failure reported "no import error was captured" - one had been
+    // captured, and then clobbered.
+    if (isWatchdog && reported) return;
+    reported = true;
     if (!panel) {
       panel = document.createElement("pre");
       panel.className = "bad";
@@ -96,27 +101,34 @@ output, including errors, not an interpretation of them.</p>
   setTimeout(function () {
     if (!window.__READY) {
       report("the module never finished loading",
-        "No import error was captured, but the script did not reach the end.\n" +
-        "Check the console for a module resolution failure.");
+        "No error was captured either, which usually means the import itself\n" +
+        "failed before any handler could see it. Check the console.\n\n" +
+        "The page loads its SDK from ./vendor/ts-sdk.mjs - if that 404s, run\n" +
+        "the build step in the README.", true);
     }
   }, 4000);
 })();
 </script>
 
 <script type="module">
-// Exact version, and the STANDALONE bundle: every dependency is resolved at
-// build time inside one file.
+// Bundled locally from node_modules by esbuild - see vendor/entry.js and the
+// build step in README. NO CDN, no version resolution at load time, works
+// offline.
 //
-// The previous version imported @aptos-labs/wallet-standard, which declares
-// ts-sdk@^7.1.0 - a RANGE. esm.sh resolved it to a build where AnyPublicKey had
-// moved, the module graph failed, and no handler ever bound. Pinning our own
-// import did not help, because the range belonged to the dependency.
+// Two earlier attempts failed here and both were dependency resolution, not the
+// wallet:
 //
-// This build has zero range sub-imports (verified), and the discovery protocol
-// below replaces that package in about ten lines.
+//   1. @aptos-labs/wallet-standard declares ts-sdk@^7.1.0 - a RANGE - which
+//      resolved to a build where AnyPublicKey had moved. Pinning our own import
+//      did nothing, because the range belonged to the dependency.
+//   2. The pinned esm.sh standalone bundle still failed to evaluate in the
+//      browser, for a reason the page could not report.
+//
+// A local bundle removes the whole class: the only thing that can break now is
+// this file or the wallet, which is what the page is meant to be testing.
 import {
   Aptos, AptosConfig, Network, Hex, MoveVector, Serializer,
-} from "https://esm.sh/@aptos-labs/ts-sdk@7.3.0/es2022/ts-sdk.bundle.mjs";
+} from "./vendor/ts-sdk.mjs";
 
 // AIP-62 / wallet-standard discovery, by hand.
 //

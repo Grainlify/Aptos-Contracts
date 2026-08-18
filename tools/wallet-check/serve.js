@@ -47,6 +47,15 @@ const server = http.createServer(async (req, res) => {
     return send(200, fs.readFileSync(path.join(__dirname, "index.html"), "utf8"), "text/html");
   }
 
+  if (req.method === "GET" && req.url.startsWith("/vendor/")) {
+    const f = path.join(__dirname, req.url.split("?")[0]);
+    if (!f.startsWith(path.join(__dirname, "vendor"))) return send(403, { error: "no" });
+    if (!fs.existsSync(f)) {
+      return send(404, { error: "vendor bundle missing - run: npx esbuild vendor/entry.js --bundle --format=esm --platform=browser --outfile=vendor/ts-sdk.mjs" });
+    }
+    return send(200, fs.readFileSync(f, "utf8"), "application/javascript");
+  }
+
   if (req.method === "GET" && req.url === "/sponsor-info") {
     return send(200, { sponsor: sponsor.accountAddress.toString(), profile: PROFILE, network: "testnet" });
   }
@@ -84,6 +93,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   send(404, { error: "not found", url: req.url });
+});
+
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`\nPORT ${PORT} IS ALREADY IN USE.\n\n` +
+      `An older copy of this server is still running and will answer requests\n` +
+      `with whatever routes it had when it started - which looks exactly like a\n` +
+      `broken page. Kill it first:\n\n  pkill -f "node serve.js"\n`);
+    process.exit(1);
+  }
+  throw e;
 });
 
 server.listen(PORT, () => {

@@ -85,6 +85,30 @@ result.
 receives USDC having paid no gas — which is the property the whole no-wallet
 onboarding story depends on.
 
+## Wallet quirks found so far
+
+**Petra** (AIP-62), tested 18 Aug 2026:
+
+| Shape | Result |
+| --- | --- |
+| `aptos:signTransaction({transaction})` | `TypeError: Cannot read properties of undefined (reading 'bcsToHex')` — **inside Petra's own inpage.js**, not our code |
+| `aptos:signTransaction({rawTransaction})` | signs |
+
+So the call shape matters, which is why the page tries several and prints every
+attempt. The first failing inside the wallet is a quirk to record, not something
+to work around silently.
+
+**But signing is not the test — signing the right message is.** A fee-payer
+transaction has its own signing message, structurally different and a different
+length from a plain one (measured: 223 bytes vs 257). Hand a wallet the inner
+`RawTransaction` and it signs the *plain* message, returns a perfectly well-formed
+authenticator, and the chain rejects the submission with `INVALID_SIGNATURE`.
+
+That failure reads as a wallet bug and is not one. The page now sets the fee payer
+before signing, and **verifies the returned signature locally against the expected
+message before submitting** — so a wallet that signs the wrong payload is reported
+here, precisely, instead of becoming a chain error.
+
 ## If a wallet fails step 2
 
 That is not a dead end, it is the finding. It means that wallet needs the

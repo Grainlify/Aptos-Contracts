@@ -128,6 +128,7 @@ output, including errors, not an interpretation of them.</p>
 // this file or the wallet, which is what the page is meant to be testing.
 import {
   Aptos, AptosConfig, Network, Hex, MoveVector, Serializer,
+  AccountAddress, generateSigningMessageForTransaction,
 } from "./vendor/ts-sdk.mjs";
 
 // AIP-62 / wallet-standard discovery, by hand.
@@ -218,7 +219,7 @@ function amountArg() {
     `amount must be a positive whole number of USDC minor units; got ${JSON.stringify(v)}`);
   return Number(v);
 }
-let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null;
+let ESCROW = null, LEAF = null, TXN = null, SENDER_AUTH = null, SPONSOR = null, EXPECTED_MSG = null;
 
 // --- 0. discovery ----------------------------------------------------------
 $("detect").onclick = () => {
@@ -380,6 +381,18 @@ $("step2").onclick = async () => {
   try {
     const mod = $("module").value.trim();
     const addr = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
+
+    // The fee payer must be known BEFORE the sender signs.
+    //
+    // A fee-payer transaction has its own signing message - different structure
+    // and a different length from a plain one (223 vs 257 bytes, measured). Hand
+    // a wallet the inner RawTransaction and it signs the PLAIN message, returns a
+    // perfectly well-formed authenticator, and the chain rejects the submission
+    // with INVALID_SIGNATURE. That is exactly what happened, and the well-formed
+    // authenticator is what makes it look like a wallet problem.
+    const info = await (await fetch("/sponsor-info")).json();
+    SPONSOR = info.sponsor;
+
     TXN = await aptos.transaction.build.simple({
       sender: addr,
       withFeePayer: true,                       // <-- the capability under test
@@ -389,26 +402,57 @@ $("step2").onclick = async () => {
         functionArguments: [ESCROW, identBytes(), amountArg(), new MoveVector([])],
       },
     });
+    // Set it before signing so the sender and the fee payer sign over the same
+    // message. serve.js signs as this same account.
+    TXN.feePayerAddress = AccountAddress.from(SPONSOR);
+    EXPECTED_MSG = generateSigningMessageForTransaction(TXN);
 
     // Wallets disagree about this call's shape. Try each and report which worked -
     // that difference is itself a finding.
     const attempts = [];
+    // Every shape now carries the fee payer, so a wallet that reads it can build
+    // the correct message.
     const tries = PATH === "AIP-62"
       ? [["aptos:signTransaction({transaction})", () => W.features["aptos:signTransaction"].signTransaction({ transaction: TXN })],
-         ["aptos:signTransaction({rawTransaction})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction })],
-         ["aptos:signTransaction(txn)", () => W.features["aptos:signTransaction"].signTransaction(TXN)]]
+         ["aptos:signTransaction({rawTransaction, feePayerAddress})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction, feePayerAddress: SPONSOR })],
+         ["aptos:signTransaction({rawTransaction})", () => W.features["aptos:signTransaction"].signTransaction({ rawTransaction: TXN.rawTransaction })]]
       : [["window.aptos.signTransaction(txn)", () => window.aptos.signTransaction(TXN)],
          ["window.aptos.signTransaction({transaction})", () => window.aptos.signTransaction({ transaction: TXN })]];
 
-    for (const [label, fn] of tries) {
-      try { const r = await fn(); SENDER_AUTH = r.args ?? r.authenticator ?? r;
-            attempts.push({ shape: label, RESULT: "signed" }); break; }
-      catch (e) { attempts.push({ shape: label, VERBATIM_ERROR: err(e) }); }
+    // Signing is not the test. Signing THE RIGHT MESSAGE is.
+    //
+    // A wallet can return a valid signature over the wrong payload, which the
+    // chain then rejects as INVALID_SIGNATURE - a failure that reads as a wallet
+    // bug and is really a message-shape mismatch. Verifying locally turns that
+    // into a precise finding here, before anything is submitted.
+    function verifies(auth) {
+      try {
+        const pk = auth?.public_key ?? auth?.publicKey;
+        const sig = auth?.signature;
+        if (!pk || !sig || !EXPECTED_MSG) return null;
+        return pk.verifySignature({ message: EXPECTED_MSG, signature: sig });
+      } catch (e) { return { verifyError: err(e) }; }
     }
 
-    if (!SENDER_AUTH) { show($("out2"), { SIGNED: false, attempts }, false); return; }
+    for (const [label, fn] of tries) {
+      try {
+        const r = await fn();
+        const auth = r.args ?? r.authenticator ?? r;
+        const ok = verifies(auth);
+        attempts.push({ shape: label, RESULT: "signed", SIGNATURE_MATCHES_EXPECTED_MESSAGE: ok });
+        if (ok === true) { SENDER_AUTH = auth; break; }
+        if (ok === false) attempts[attempts.length - 1].note =
+          "signed, but over a DIFFERENT message than the fee-payer transaction " +
+          "being submitted. Submitting this would fail with INVALID_SIGNATURE.";
+        if (ok === null) { SENDER_AUTH = auth; attempts[attempts.length - 1].note =
+          "signed, but this page could not verify the signature locally - " +
+          "step 3 will tell you whether the chain accepts it."; break; }
+      } catch (e) { attempts.push({ shape: label, VERBATIM_ERROR: err(e) }); }
+    }
+
+    if (!SENDER_AUTH) { show($("out2"), { SIGNED: false, feePayer: SPONSOR, attempts }, false); return; }
     $("step3").disabled = false;
-    show($("out2"), { SIGNED: true, attempts, authenticator: SENDER_AUTH }, true);
+    show($("out2"), { SIGNED: true, feePayer: SPONSOR, attempts, authenticator: SENDER_AUTH }, true);
   } catch (e) { show($("out2"), err(e), false); }
 };
 

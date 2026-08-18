@@ -70,6 +70,17 @@ const server = http.createServer(async (req, res) => {
         const txn = SimpleTransaction.deserialize(new Deserializer(hexToBytes(transaction)));
         const senderAuthenticator = AccountAuthenticator.deserialize(new Deserializer(hexToBytes(senderAuth)));
 
+        // The sender signed over a specific fee payer. If that is not this
+        // account, the two signatures cover different messages and the chain
+        // rejects it as INVALID_SIGNATURE - which reads as a wallet fault and is
+        // not one. Refuse here, where the cause is still visible.
+        const signedOver = txn.feePayerAddress ? txn.feePayerAddress.toString() : null;
+        const ours = sponsor.accountAddress.toString();
+        if (signedOver && signedOver !== "0x0" && signedOver.toLowerCase() !== ours.toLowerCase()) {
+          return send(200, { ok: false, stage: "sponsor",
+            error: `the sender signed a transaction whose fee payer is ${signedOver}, ` +
+                   `but this sponsor is ${ours}. Those are different signing messages.` });
+        }
         const feePayerAuthenticator = aptos.transaction.signAsFeePayer({ signer: sponsor, transaction: txn });
 
         const submitted = await aptos.transaction.submit.simple({

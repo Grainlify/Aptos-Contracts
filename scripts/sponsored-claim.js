@@ -30,7 +30,9 @@ const {
   Aptos, AptosConfig, Network, Account, Ed25519PrivateKey, MoveVector,
 } = require("@aptos-labs/ts-sdk");
 
-const CONFIG = "./.aptos/config.yaml";
+// Path to an aptos CLI config holding throwaway profiles. Point this at your
+// own; never at a profile holding real value.
+const CONFIG = process.env.APTOS_CONFIG || "./.aptos/config.yaml";
 
 // Minimal parse: profile name -> private_key. Local throwaway keys only.
 function keys() {

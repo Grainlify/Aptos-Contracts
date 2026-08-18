@@ -2,8 +2,22 @@
 
 One event's budget, one Merkle claim root, pull claims only.
 
-Nothing here has been deployed to any network. No payout has ever been made by
-Grainlify on any chain.
+> ### Unaudited. Testnet only.
+>
+> **These contracts have not been audited and must not be used with real value.**
+> Everything here is deployed to Aptos testnet, where the tokens are worth
+> nothing and exist to be thrown away.
+>
+> A mainnet deployment will follow an audit, from a different account, under a
+> multisig. Nothing in this repository is provisioned for value that matters —
+> the testnet key is committed to nowhere and protects nothing, and the admin
+> capability is an address comparison rather than anything hardened.
+>
+> Read the source before trusting any of it. The comments say where the sharp
+> edges are, and there are several.
+
+No payout has ever been made by Grainlify on any chain, on testnet or otherwise,
+beyond the verification claims recorded below.
 
 ## What this is
 

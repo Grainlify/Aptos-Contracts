@@ -15,8 +15,17 @@ cd tools/wallet-check
 npm install                                  # once
 npm run build                                # once — bundles the SDK locally
 npm test                                     # the wallet boundary, offline
-node serve.js                                # http://localhost:8899
+
+# Wallet checks only:
+node serve.js
+
+# Plus the API steps (A and B):
+API_BASE=http://localhost:8080 API_TOKEN=<bearer> node serve.js
 ```
+
+`API_TOKEN` is read from the environment and never written to a file or shown in
+the page. It is a live session; this harness exists to prove the endpoints, not
+to leave a credential in a scratch directory.
 
 `npm test` needs no wallet and no network. It runs the boundary described below
 against the **verbatim responses real wallets returned**, and
@@ -68,6 +77,37 @@ a claimed leaf cannot be reclaimed:
 ./setup-escrow.sh 0x<addr> wallet-check-petra
 ./setup-escrow.sh 0x<addr> wallet-check-connect
 ```
+
+## Steps A and B — proving the API before a UI exists
+
+The frontend is built against these endpoints, and **every one of the three
+contract points below produces a valid signature over the wrong bytes when
+broken** — the failure that reads as a wallet bug and is not. So they are
+exercised against a real Petra rather than described.
+
+**A — address registration, end to end.** A real nonce from the real endpoint, a
+real Petra signature over the real AIP-62 envelope, verified and stored by the
+real handler.
+
+The page **deliberately does not send `fullMessage`.** The server rebuilds the
+envelope from the nonce it issued, because a client that supplies both the
+payload and a signature over it has been asked to mark its own homework. The page
+does print the envelope it *expects* alongside whatever the wallet reports, and
+flags a mismatch — so a divergence shows up here, in terms of the two strings,
+rather than as a generic `signature_invalid`.
+
+`signMessage` is called with **no optional flags**. AIP-62 lets a caller fold
+`address`, `application` and `chainId` into the envelope, each adding a line the
+server cannot reconstruct if it did not ask for one.
+
+**B — claims and proof verification.** Fetches `/me/payout-readiness` and
+`/me/claims`, then recomputes each root **in the browser** from the served leaf
+and proof: `node = sha256(0x01 || min(a,b) || max(a,b))`. A proof that does not
+reconstruct the root is worse than no proof — it aborts on chain and reads as the
+contract rejecting the claimant.
+
+Neither step touches a salt. That is the point: the leaves were persisted at
+build time, which is what allows the salt to be destroyed at all.
 
 ## What each step is actually testing
 

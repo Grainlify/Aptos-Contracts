@@ -10,6 +10,16 @@
 // together. That is the same split a production sponsor service would have.
 const fs = require("fs");
 const http = require("http");
+
+// Where the API under test lives, and the session to call it with.
+//
+//   API_BASE=http://localhost:8080 API_TOKEN=<bearer> node serve.js
+//
+// The token is read from the environment and never written to a file or echoed
+// to the page: it is a live session, and the point of this harness is to prove
+// the endpoints, not to leave a credential lying in a scratch directory.
+const API_BASE = process.env.API_BASE || "http://localhost:8080";
+const API_TOKEN = process.env.API_TOKEN || "";
 const path = require("path");
 const {
   Aptos, AptosConfig, Network, Account, Ed25519PrivateKey,
@@ -54,6 +64,44 @@ const server = http.createServer(async (req, res) => {
       return send(404, { error: "vendor bundle missing - run: npx esbuild vendor/entry.js --bundle --format=esm --platform=browser --outfile=vendor/ts-sdk.mjs" });
     }
     return send(200, fs.readFileSync(f, "utf8"), "application/javascript");
+  }
+
+  // --- proxy to the Grainlify API -----------------------------------------
+  //
+  // The browser cannot call the API directly (different origin, and the page
+  // holds no session), so the harness forwards. It attaches the bearer token
+  // supplied on the command line, which is the ONLY thing it adds - the body
+  // and the path are passed through untouched, so what this exercises is the
+  // real endpoint and not a convenience wrapper around it.
+  if (req.url.startsWith("/api/")) {
+    const target = API_BASE + req.url.slice(4);
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", async () => {
+      try {
+        const r = await fetch(target, {
+          method: req.method,
+          headers: {
+            "Content-Type": "application/json",
+            ...(API_TOKEN ? { Authorization: "Bearer " + API_TOKEN } : {}),
+          },
+          body: req.method === "GET" ? undefined : body,
+        });
+        const text = await r.text();
+        res.writeHead(r.status, { "Content-Type": "application/json" });
+        res.end(text);
+      } catch (e) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ proxy_error: String(e && e.message || e), target }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/api-info") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ api: API_BASE, tokenPresent: Boolean(API_TOKEN) }));
+    return;
   }
 
   if (req.method === "GET" && req.url === "/sponsor-info") {

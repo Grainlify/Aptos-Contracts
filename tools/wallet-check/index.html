@@ -53,6 +53,25 @@ output, including errors, not an interpretation of them.</p>
 <fieldset>
   <legend>1 · signMessage, and does the key derive to the address</legend>
   <button id="step1" disabled>Run step 1</button>
+</fieldset>
+
+<fieldset>
+  <legend>A · register this address with the API (real endpoint, real signature)</legend>
+  <p>Proves the three contract points end to end: the challenge comes from the
+  real endpoint, Petra signs the real AIP-62 envelope, and the server verifies by
+  reconstructing that envelope from the nonce it issued.</p>
+  <label>chain_id <input id="apiChain" value="aptos-testnet" size="18"></label>
+  <button id="stepA" disabled>Register address</button>
+  <pre id="outA"></pre>
+</fieldset>
+
+<fieldset>
+  <legend>B · fetch claims and verify the proof in the browser</legend>
+  <p>Serves a leaf and proof for this address and recomputes the root from them,
+  so a bad proof is caught here rather than as a chain abort that reads like the
+  contract rejecting the claimant.</p>
+  <button id="stepB" disabled>Fetch claims</button>
+  <pre id="outB"></pre>
   <pre id="out1">Connect first.</pre>
 </fieldset>
 
@@ -676,6 +695,127 @@ $("step1").onclick = async () => {
       DERIVES_TO_CONNECTED_ADDRESS: matches }, matches !== false);
   } catch (e) { show($("out1"), err(e), false); }
 };
+
+// --- A. register this address with the real API ----------------------------
+//
+// Every one of the three contract points is exercised here, and each of them
+// produces a VALID SIGNATURE OVER THE WRONG BYTES when broken - the failure that
+// reads as a wallet bug and is not:
+//
+//   1. the signed payload is the AIP-62 envelope, not our message;
+//   2. the server rebuilds that envelope from the nonce it issued, so the page
+//      deliberately does NOT send fullMessage - if it did, the server would be
+//      verifying a payload the client chose;
+//   3. signMessage is called with no optional flags, because the server cannot
+//      reconstruct a line it did not ask for.
+//
+// The page prints the envelope it believes was signed, so a mismatch is visible
+// here rather than as a generic signature_invalid from the API.
+const api = async (method, path, body) => {
+  const r = await fetch("/api" + path, {
+    method, headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let parsed = null;
+  const text = await r.text();
+  try { parsed = JSON.parse(text); } catch (_) { parsed = { unparseable: text.slice(0, 400) }; }
+  return { status: r.status, body: parsed };
+};
+
+$("stepA").onclick = async () => {
+  try {
+    const addr = String(ACCOUNT?.address ?? ACCOUNT?.accountAddress ?? "");
+    if (!addr) throw new Error("connect a wallet first");
+    const chain = $("apiChain").value.trim();
+
+    const ch = await api("POST", "/me/payout-address/challenge", { chain_id: chain, address: addr });
+    if (ch.status !== 200) { show($("outA"), { step: "challenge", ...ch }, false); return; }
+
+    const { nonce, message } = ch.body;
+
+    // No optional flags. Requesting address/application/chainId would each add a
+    // line to the envelope that the server cannot rebuild.
+    const raw = PATH === "AIP-62"
+      ? await W.features["aptos:signMessage"].signMessage({ message, nonce })
+      : await window.aptos.signMessage({ message, nonce });
+
+    const u = unwrap(raw, "aptos:signMessage");
+    if (!u.ok) { show($("outA"), { step: "signMessage", ...u }, false); return; }
+    const out = u.value;
+
+    const expectedEnvelope = "APTOS\nmessage: " + message + "\nnonce: " + nonce;
+    const pkBytes = bytesOfLength(out.publicKey ?? out.public_key ?? ACCOUNT?.publicKey, [32], 0);
+    const sigBytes = bytesOfLength(out.signature, [64], 0);
+
+    const post = await api("POST", "/me/payout-address", {
+      chain_id: chain,
+      address: addr,
+      public_key: pkBytes ? hexOf(pkBytes) : null,
+      signature: sigBytes ? hexOf(sigBytes) : null,
+      nonce,
+      // fullMessage is deliberately NOT sent. The server rebuilds it.
+    });
+
+    const ok = post.status === 201;
+    show($("outA"), {
+      REGISTERED: ok,
+      challenge: { nonce, message },
+      expectedEnvelope,
+      walletReportedFullMessage: out.fullMessage ?? "<wallet did not return one>",
+      ENVELOPE_MATCHES: out.fullMessage ? (out.fullMessage === expectedEnvelope) : null,
+      note: out.fullMessage && out.fullMessage !== expectedEnvelope
+        ? "The wallet signed a DIFFERENT envelope than the server will rebuild. That is the " +
+          "whole class of failure this step exists to catch - the signature is valid and over " +
+          "the wrong bytes. Check whether signMessage was called with optional flags."
+        : undefined,
+      response: post,
+    }, ok);
+    if (ok) $("stepB").disabled = false;
+  } catch (e) { show($("outA"), err(e), false); }
+};
+
+// --- B. fetch claims and verify the proof locally ---------------------------
+$("stepB").onclick = async () => {
+  try {
+    const readiness = await api("GET", "/me/payout-readiness?chain_id=" + encodeURIComponent($("apiChain").value.trim()));
+    const claims = await api("GET", "/me/claims");
+    const list = claims.body?.claims ?? [];
+
+    // Recompute the root from the served leaf and proof. A proof that does not
+    // reconstruct the root is worse than no proof: it aborts on chain and reads
+    // as the contract rejecting the claimant.
+    // node = sha256(0x01 || min(a,b) || max(a,b)) — the sorted pair removes the
+    // need to record left/right, and the 0x01 prefix is what stops a leaf digest
+    // being replayed as an internal node. Both are asserted in internal/chain.
+    const verified = [];
+    for (const cl of list) {
+      try {
+        let acc = Hex.fromHexString(cl.leaf_hash).toUint8Array();
+        for (const p of cl.proof) {
+          const sib = Hex.fromHexString(p).toUint8Array();
+          const [a, b] = compareBytes(acc, sib) <= 0 ? [acc, sib] : [sib, acc];
+          acc = await sha256(new Uint8Array([0x01, ...a, ...b]));
+        }
+        verified.push({ settlement: cl.settlement_id, recomputed: hexOf(acc), root: cl.root,
+                        PROOF_VERIFIES: hexOf(acc) === cl.root });
+      } catch (e) { verified.push({ settlement: cl.settlement_id, verifyError: err(e) }); }
+    }
+
+    show($("outB"), {
+      readiness: readiness.body,
+      claimCount: list.length,
+      claims: list,
+      proofCheck: verified,
+      ALL_PROOFS_VERIFY: verified.length > 0 && verified.every((v) => v.PROOF_VERIFIES === true),
+    }, verified.length > 0 && verified.every((v) => v.PROOF_VERIFIES === true));
+  } catch (e) { show($("outB"), err(e), false); }
+};
+
+function compareBytes(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+}
+async function sha256(bytes) { return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)); }
 
 // --- 2. sign as sender of a fee-payer transaction --------------------------
 $("step2").onclick = async () => {

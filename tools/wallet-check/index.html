@@ -805,13 +805,31 @@ $("stepB").onclick = async () => {
       } catch (e) { verified.push({ settlement: cl.settlement_id, verifyError: err(e) }); }
     }
 
+    // Three outcomes, not two.
+    //
+    // "Nothing to verify" is a FACT, not a failure. The first version reported
+    // ALL_PROOFS_VERIFY: false for an account with no claims, which reads as the
+    // proof path being broken when it has simply never been exercised - the
+    // empty-list-means-two-things class, in the harness whose job is catching
+    // exactly that.
+    //
+    // The readiness block above says WHY there are none, which is the signal an
+    // empty list cannot carry on its own.
+    const failures = verified.filter((v) => v.PROOF_VERIFIES !== true);
+    const outcome = list.length === 0
+      ? "NO_CLAIMS_TO_VERIFY — nothing is owed to this address in a published settlement yet. " +
+        "This is not a proof failure; read `readiness.state` for why."
+      : failures.length === 0
+        ? "ALL_PROOFS_VERIFY"
+        : "SOME_PROOFS_FAILED — " + failures.length + " of " + verified.length;
+
     show($("outB"), {
+      OUTCOME: outcome,
       readiness: readiness.body,
       claimCount: list.length,
       claims: list,
       proofCheck: verified,
-      ALL_PROOFS_VERIFY: verified.length > 0 && verified.every((v) => v.PROOF_VERIFIES === true),
-    }, verified.length > 0 && verified.every((v) => v.PROOF_VERIFIES === true));
+    }, failures.length === 0);
   } catch (e) { show($("outB"), err(e), false); }
 };
 

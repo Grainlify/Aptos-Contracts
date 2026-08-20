@@ -565,6 +565,10 @@ $("connect").onclick = async () => {
 
     // Refuse to proceed rather than produce findings that are really this.
     $("step1").disabled = mismatch;
+    // Step A's only genuine precondition is the same one: a connected wallet on
+    // the network under test. It registers an address over HTTP and touches no
+    // contract, so nothing about the escrow gates it.
+    $("stepA").disabled = mismatch;
     if (mismatch) { $("step2").disabled = true; $("step3").disabled = true; }
   } catch (e) { show($("out0"), err(e), false); }
 };
@@ -948,5 +952,32 @@ $("step3").onclick = async () => {
     show($("out3"), await res.json(), true);
   } catch (e) { show($("out3"), err(e), false); }
 };
+// --- dead-control check ----------------------------------------------------
+//
+// A button that starts disabled and has no code path clearing it can never be
+// pressed, and nothing else here notices: the module parses, npm test passes,
+// and the page renders. Step A shipped exactly like that - the harness built to
+// exercise the endpoints before contributors do, unable to exercise anything.
+//
+// This turns "did I wire the enable" from something to remember into something
+// the page reports. Shown on the page rather than logged to the console, because
+// this file already learned that lesson once: a module-load failure was
+// invisible for a debugging round trip because it only reached the console.
+(function () {
+  const src = [...document.scripts].map((s) => s.textContent).join("\n");
+  const dead = [...document.querySelectorAll("button[disabled]")]
+    .map((b) => b.id)
+    .filter((id) => id && !new RegExp('\\$\\("' + id + '"\\)\\.disabled\\s*=').test(src));
+  if (!dead.length) return;
+  const el = document.createElement("pre");
+  el.className = "bad";
+  el.textContent =
+    "DEAD CONTROL: " + dead.join(", ") + "\n\n" +
+    "These buttons start disabled and no code path ever clears them, so they can\n" +
+    "never be pressed. That is a wiring bug in this page, not something you have\n" +
+    "failed to set up - nothing you click will enable them.";
+  document.body.insertBefore(el, document.body.firstChild);
+})();
+
 window.__READY = true;
 </script>

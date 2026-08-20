@@ -301,6 +301,22 @@ Extensions genuinely fight over globals: a first run here produced
 you think. The AIP-62 path is per-wallet and does not have that problem, which is
 why the picker prefers it and legacy `window.aptos` is offered last.
 
+## Dead controls
+
+At load the page checks every button that starts `disabled` against its own
+source, and reports any with no code path that clears it.
+
+**Step A shipped exactly like that**: declared disabled, never enabled, so the
+harness built to exercise the endpoints before contributors do could not exercise
+anything. Nothing else noticed — the module parsed, `npm test` passed, the page
+rendered, and every check was green on a page where clicking did nothing.
+
+That is the trap this repository already has an entry for, so the check exists to
+make wiring an enable something the page reports rather than something somebody
+remembers. It is shown on the page rather than logged, because this file learned
+that lesson once already: a module-load failure was invisible for a debugging
+round trip because it only reached the console.
+
 ## If the page itself breaks
 
 A module-load failure used to be invisible: no output, no error in the page, dead

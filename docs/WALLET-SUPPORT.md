@@ -1,5 +1,40 @@
 # Wallet support, and the claim flow that follows from it
 
+> ## ⚠ CORRECTION — SPONSORSHIP IS DEMONSTRATED, NOT DEPLOYED
+>
+> **Nothing in production pays a contributor's gas.** The sponsored claim
+> recorded below really happened, and the fee payer was a **local script**:
+> `tools/wallet-check/serve.js`, reading a testnet key from a gitignored
+> `.aptos/config.yaml` and listening on `localhost:8899`. A contributor clicking
+> Claim goes nowhere near it.
+>
+> There is no fee-payer code in `Grainlify-Backend` or `Grainlify-Frontend` —
+> the backend only makes read-only view calls and never builds, signs or submits
+> a transaction. `internal/chainops` states it plainly: *the contributor submits
+> this, signing with their own key and paying their own gas.*
+>
+> **So the flow copy below is a specification, not a description**, and two of
+> its sentences are currently false in production:
+> *"We cover the network cost"* and *"nobody on the supported path pays
+> anything."* They are left in place, marked, because they describe the intended
+> flow that the claim screen should implement — not because they are true today.
+>
+> Tracked as **[Grainlify-Backend#537](https://github.com/Grainlify/Grainlify-Backend/issues/537)**. On testnet this hides: APT is free from a
+> faucet, so a self-paid rehearsal passes while exercising a path no real
+> deployment uses, and the faucet is exactly what will not be there.
+>
+> ### Delete this block when — and only when — all of these hold
+>
+> 1. A production endpoint signs as fee payer and submits (the deployed
+>    equivalent of `serve.js`'s `/sponsor`).
+> 2. A contributor claim has landed **through that endpoint**, with the
+>    transaction hash recorded here beside the milestone below.
+> 3. `grep -rniE "feePayer|fee_payer" Grainlify-Backend --include="*.go"` returns
+>    the sponsor service rather than nothing.
+>
+> If you are deleting this because the copy "looks fixed", stop: the copy was
+> never the problem.
+
 **Decision: the first payout is Petra only.** Petra is the one wallet verified end
 to end against the deployed module. Backpack could not be tested. Aptos Connect
 has not been tried. Rather than build capability detection and adaptive copy for
@@ -153,6 +188,10 @@ wrong extension to sign.
 "We cover the network cost" is the only fee sentence anywhere in the flow, and it
 is a statement about what we do rather than a promise about what wallets support.
 
+**Not true in production yet** — see the correction at the top of this file.
+Until the sponsor service exists, a contributor pays their own gas, and a
+contributor who has never held APT cannot pay it at all.
+
 ### 6. Done
 
 > **12.50 USDC is in your wallet.**
@@ -172,7 +211,12 @@ between options, and there is one option.
 
 **No fee-fallback copy.** Petra supports sponsorship, so nobody on the supported
 path pays anything, and copy for a case that cannot currently arise is copy that
-will be wrong by the time it can. It comes back with the second wallet, if that
+will be wrong by the time it can.
+
+**This reasoning is currently inverted.** The case it dismisses — a contributor
+paying their own gas — is the ONLY case that can arise today, because no sponsor
+service is deployed. The decision stands for the flow this document specifies;
+it is wrong as a description of what ships now. It comes back with the second wallet, if that
 wallet needs it.
 
 **No adaptive copy.** Same reason. Three copy states for one verified wallet is

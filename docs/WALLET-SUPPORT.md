@@ -153,6 +153,22 @@ wrong extension to sign.
 "We cover the network cost" is the only fee sentence anywhere in the flow, and it
 is a statement about what we do rather than a promise about what wallets support.
 
+> ### ⚠️ This sentence is not true yet — do not ship it verbatim
+>
+> Sponsorship is **demonstrated, not deployed**. The testnet claim in the table
+> above is real and the fee payer worked. **Nothing in production implements it**:
+> there is no fee-payer service, no sponsor account handling, and no endpoint that
+> co-signs a claim. A contributor clicking Claim today pays their own gas — on a
+> first transaction, from a wallet that by construction holds no APT.
+>
+> This block is specimen copy for the claim screen, so shipping it as written is
+> how the false promise reaches somebody. Until the fee payer is deployed, the
+> claim screen must say gas is paid by the claimant, or say nothing about fees at
+> all — it must not say we cover them.
+>
+> Tracked in Grainlify-Backend#536, which carries the security requirements a fee
+> payer needs. Delete this block when that lands, and not before.
+
 ### 6. Done
 
 > **12.50 USDC is in your wallet.**
